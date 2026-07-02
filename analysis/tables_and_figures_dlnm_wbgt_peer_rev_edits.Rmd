@@ -2693,41 +2693,7 @@ summary(crisis_dlnm_eligible$sum_nds)
 
 
 
-# ============================================================================
 # PEER REVIEW RESPONSE - PHASE 2a: SEASONAL ADJUSTMENT SENSITIVITY ANALYSIS
-# ============================================================================
-#
-# WHAT THIS ADDRESSES:
-#   - Referee 1's main concern: our primary models adjust for
-#     `season_delivery` (wet vs. dry season AT DELIVERY), which may be
-#     collinear with the WBGT exposure windows themselves (overadjustment),
-#     and may not be the most meaningful representation of calendar-time
-#     confounding.
-#   - Referee 2, Comment 2: requests (a) an alternative seasonal/calendar
-#     adjustment (e.g., calendar month or sin/cos terms) and (b) a
-#     conception-month sensitivity analysis.
-#
-# WHAT THIS CODE DOES:
-#   Re-fits the 5 primary trimester-average models (the `models` list
-#   created above, using `stress_data_with_temp`) three times, swapping
-#   out ONLY the seasonal adjustment term each time:
-#     1) season_delivery               -- original (wet/dry at delivery)
-#     2) month_conception               -- calendar month of conception
-#                                           (addresses the "conception-month
-#                                           sensitivity analysis" request)
-#     3) sin/cos of conception day-of-year -- smooth, 2-df harmonic term
-#                                           representing the annual cycle,
-#                                           which avoids the hard wet/dry
-#                                           cutoff and is less likely to be
-#                                           collinear with WBGT
-#
-#   All other covariates (age, bmi, wealthindex, pregchn, married_bin,
-#   medlev_bin) are held identical to the primary models so the WBGT
-#   exposure estimates are directly comparable across specs.
-#
-#   A small VIF (variance inflation factor) check is also included to
-#   directly address the "season vs. temperature collinearity" concern.
-# ============================================================================
 
 ```{r peer_review_seasonal_sensitivity}
 
@@ -2901,68 +2867,6 @@ gtsave(
 )
 ```
 
-**How to interpret this for the response letter:**
-
-- If the WBGT odds ratios (and their significance) are **similar across all
-  three seasonal adjustment specs**, this directly rebuts the overadjustment
-  /collinearity concern: the WBGT-stress association is not an artifact of
-  how season is coded, and is robust to using conception-month or a smooth
-  seasonal cycle instead of season-at-delivery.
-- The **VIF table** (Step 6) quantifies collinearity directly -- a low VIF
-  (e.g., < 5, ideally close to 1-2) for the WBGT term under all three specs
-  shows that adjusting for season does not substantially inflate the
-  variance of the WBGT estimate, addressing Referee 1's main concern head-on.
-- If results for the **calendar month of conception** spec are materially
-  different, this also serves as the "conception-month sensitivity analysis"
-  Referee 2 requested in Comment 2.
-
-
-# ============================================================================
-# PEER REVIEW RESPONSE - PHASE 2a (CONTINUED): SEASONAL ADJUSTMENT
-# SENSITIVITY FOR THE PRIMARY DLNM MODEL (Figures 1 & 2)
-# ============================================================================
-#
-# WHY THIS IS NEEDED IN ADDITION TO THE ANALYSIS ABOVE:
-#   The sensitivity analysis above only re-fit the trimester-AVERAGE models
-#   (the `models` list). It did NOT touch the primary DLNM model
-#   (`model_polr`, built on `cb` + `temperature_lags_wide`), which is the
-#   basis for Figures 1 & 2 and the weekly cumulative-effect tables -- i.e.
-#   the headline result of the paper.
-#
-#   Referee 2's Comment 2, point (1) explicitly asks for adjustment for
-#   "the specific calendar month or sin/cos terms FOR THE RELEVANT EXPOSURE
-#   PERIOD, not just the season of delivery." For the DLNM, the relevant
-#   exposure period is the full conception-aligned window (-30 to +210
-#   days), so `season_delivery` (a single wet/dry label tied to the
-#   DELIVERY date, which can be up to ~8 months after conception) is an
-#   even weaker match here than for the trimester models. `date_conception`
-#   is the natural anchor for this whole window, making month-of-conception
-#   / sin-cos-of-conception-day exactly the right covariates to test.
-#
-# WHAT THIS CODE DOES:
-#   IMPORTANT: by this point in the script, the global objects `cb`,
-#   `model_polr`, `temperature_lags_wide`, `temp_data_matrix`, and
-#   `temp_median` have all been OVERWRITTEN by later DLNM blocks (the last
-#   one builds a model for `wbgt_delta`, not max WBGT!). To avoid silently
-#   reusing the wrong model/crossbasis, Step 1 below REBUILDS the max-WBGT
-#   DLNM inputs from scratch, using distinct `*_fig1` names, with the exact
-#   same pipeline as the original Figure 1 block (lines ~143-215).
-#
-#   We then re-fit this max-WBGT model three times, swapping out only the
-#   seasonal term (same 3 specs as above). For each spec, we compute:
-#     (a) the WEEKLY cumulative effects at the SAME windows already
-#         highlighted in the main analysis (`cum_99_week_135`,
-#         `cum_99_week_150`, `cum_25_week_0`) -- i.e. exactly the quantities
-#         reported in-text, just re-estimated under each seasonal spec.
-#         (We deliberately do NOT collapse across the full 241-day lag
-#         range into a single "overall cumulative" effect -- summing that
-#         many highly-correlated daily log-odds compounds into
-#         astronomically large/small numbers and is not how the paper's
-#         results are reported or interpreted.)
-#     (b) the full lag-response curve at the 99th percentile vs. median,
-#         overlaid across the three specs, so we can visually confirm the
-#         shape of Figure 1D is not sensitive to the seasonal adjustment.
-# ============================================================================
 
 ```{r peer_review_dlnm_seasonal_sensitivity}
 
@@ -3176,71 +3080,6 @@ era5 %>%
   theme_minimal()
 ```
 
-**How to interpret this for the response letter:**
-
-- The table in Step 5 gives one overall cumulative OR (99th and 25th
-  percentile WBGT vs. median, across the FULL exposure window) per seasonal
-  adjustment spec. If these are similar in magnitude, direction, and
-  significance across all three specs, this is strong evidence that the
-  headline DLNM result is **not** an artifact of how season is coded --
-  directly answering Referee 2's concern that the heat effect could really
-  be a "season -> farming -> financial stress" pathway rather than a direct
-  heat effect.
-- The overlay plot in Step 6 shows whether the **shape** of the lag-response
-  curve underlying Figure 1D (timing/magnitude of effects across gestation)
-  is preserved when season is represented differently -- useful if a referee
-  asks whether the *timing* of effects (not just the overall magnitude)
-  could be confounded by season.
-- As with the trimester-level analysis, the **calendar month of conception**
-  spec doubles as the "separate sensitivity analysis based on month of
-  conception" requested in Comment 2, point (2) -- now covering the primary
-  DLNM model as well.
-
-
-# ============================================================================
-# PEER REVIEW RESPONSE - PHASE 2c: ERA5 GRID-CELL CLUSTERING SENSITIVITY
-# ============================================================================
-#
-# WHAT THIS ADDRESSES:
-#   Referee 2, Comment 3: ERA5 is ~25km resolution, so the 312 participants
-#   across 41 communities are actually assigned to only ~10 distinct ERA5
-#   grid cells. Participants who share a grid cell share an IDENTICAL daily
-#   WBGT exposure history -- their exposure data are not independent. The
-#   referee asks for a sensitivity analysis using small-cluster-aware
-#   methods, clustering by ERA5 grid cell.
-#
-# WHY A CLUSTER BOOTSTRAP:
-#   `polr` is not supported by sandwich::vcovCL() for asymptotic
-#   cluster-robust SEs, and with only ~10 clusters, asymptotic
-#   cluster-robust SEs would be unreliable anyway. A CLUSTER (BLOCK)
-#   BOOTSTRAP -- resampling ERA5 cells (not individuals) with replacement,
-#   refitting the model on each resample, and using the empirical spread of
-#   the resulting estimates as the "clustered" uncertainty -- is the
-#   standard small-cluster-aware approach here.
-#
-# WHAT THIS CODE DOES:
-#   1) Re-derives the ERA5 grid-cell assignment for each participant
-#      (self-contained -- mirrors the Phase 1 `peer_review_era5_grid_cells`
-#      chunk, but joins directly onto the Figure-1 DLNM data, `temperature_
-#      lags_wide_fig1`).
-#   2) Cluster-bootstraps the PRIMARY (season_delivery) Figure-1 model: each
-#      replicate resamples the ~10 ERA5 cells WITH REPLACEMENT and refits
-#      the model on the resulting (duplicated-cluster) dataset.
-#   3) For the same 3 windows used in Phase 2a (days 135-141, 150-156 at the
-#      99th pct.; days 0-6 at the 25th pct.), compares the model-based CI
-#      (assumes 312 independent obs.) to the cluster-bootstrap CI (accounts
-#      for the ~10-cell exposure structure).
-#   4) Runs a LEAVE-ONE-ERA5-CELL-OUT analysis: refits the model 10 times,
-#      each time dropping all participants in one ERA5 cell, to check
-#      whether any single grid cell is driving the result.
-#
-# NOTE ON SEASONAL SPEC: this uses the PRIMARY (season_delivery) model, to
-# keep this sensitivity analysis isolated from the seasonal-adjustment
-# sensitivity in Phase 2a. `fit_dlnm_seasonal_sensitivity()` (defined in the
-# Phase 2a DLNM chunk above) makes it trivial to re-run this with the
-# sin/cos or month-of-conception spec instead, by changing `season_term`
-# below to "sin_doy_conception + cos_doy_conception" or "month_conception".
-# ============================================================================
 
 ```{r peer_review_era5_cluster_sensitivity}
 
@@ -3664,46 +3503,6 @@ gtsave(
 )
 ```
 
-**How to interpret this for the response letter:**
-
-- The **cluster-bootstrap table** (Step 6) directly answers Referee 2's
-  Comment 3: it shows whether accounting for the fact that the 312
-  participants effectively share ~10 distinct WBGT exposure histories
-  widens the confidence intervals enough to change the conclusions. If the
-  cluster-bootstrap CIs are similar to (or only modestly wider than) the
-  model-based CIs and still exclude 1, this is strong evidence the result is
-  not an artifact of treating clustered exposure data as independent.
-- The **histograms** (Step 7) show the full bootstrap distribution, not just
-  the percentile CI -- useful for spotting skew or bimodality that a simple
-  CI might hide (a real risk with only ~10 clusters).
-- The **lag-curve overlay** (Step 7b) is the most direct answer to "are the
-  same gestational days still significant?" -- it rebuilds the 25th- and
-  99th-percentile slices from Figure 1 with a second, cluster-bootstrap
-  confidence band layered on top of the original model-based band. The
-  printed `lagcurve_sig_summary` table gives the gestational-day range where
-  each band excludes OR = 1.
-- The **leave-one-cell-out table** (Step 8) shows how much each cumulative
-  effect moves when any single ERA5 grid cell's participants are removed
-  entirely. If the OR range across all 10 leave-one-out refits stays on the
-  same side of 1 (and roughly within the original CI), no single grid cell
-  is driving the result -- directly addressing the "41 communities -> ~10
-  exposure points" effective-sample-size concern.
-- Together, these analyses give you a concrete, quantitative answer to
-  "what if the effective sample size is closer to 10 than 312, and which
-  days does that actually affect?" -- which is the heart of Referee 2's
-  Comment 3.
-
-
-### ERA5 grid-cell clustering: trimester-average models
-
-The same ~10-cell clustering concern applies to the 5 trimester-average
-models reported earlier (Pre-Conception, First/Second/Third Trimester,
-Entire Pregnancy). Those models use a single scalar exposure per person
-(no crossbasis), so the cluster bootstrap here is a direct refit-and-
-resample on `stress_data_with_temp` -- much cheaper than the DLNM version
-above. We use the same `season_delivery` adjustment as the model-based
-comparator (the "Season at delivery (original)" row of
-`seasonal_sensitivity_tbl`), for consistency with the DLNM check above.
 
 ```{r peer_review_era5_cluster_trimester}
 
@@ -3837,63 +3636,8 @@ gtsave(
 )
 ```
 
-**How to interpret this for the response letter:**
-
-- This table is the trimester-model analogue of the DLNM cluster-bootstrap
-  table above -- it shows whether the headline trimester-average results
-  (Entire Pregnancy, Pre-Conception, First Trimester) hold up once the
-  confidence intervals account for the ~10-cell exposure structure rather
-  than treating all 312 participants as independent.
-- If the cluster-bootstrap CIs for Entire Pregnancy and First Trimester
-  remain on the same side of 1 (even if wider), this supports the
-  robustness of the trimester-level findings to the same effective-sample-
-  size concern raised for the DLNM.
-- This section deliberately uses only the primary `season_delivery`
-  adjustment, keeping the seasonal-adjustment comparison (Phase 2a) and the
-  spatial-clustering comparison (Phase 2c) as two separate, single-axis
-  sensitivity analyses rather than a combined grid.
-
-
-### Limitations: spatial clustering of WBGT exposure (Referee 2, Comment 3)
-
-*The following paragraph is drafted for the manuscript's Discussion /
-limitations section and/or the response letter, summarizing the
-cluster-bootstrap and leave-one-cell-out analyses above.*
-
-> Our primary models treat each participant's WBGT exposure history as an
-> independent observation. In practice, the ERA5 reanalysis product used
-> here has a spatial resolution of approximately 25 km, so the 312
-> participants across 41 communities are drawn from only approximately 10
-> distinct grid-cell exposure series -- i.e., many participants share
-> essentially identical daily WBGT histories. To assess how much this
-> spatial clustering of exposure affects our inference, we conducted a
-> cluster (block) bootstrap, resampling these ~10 grid cells with
-> replacement and refitting both the primary DLNM and the trimester-average
-> models (500 replicates each). Point estimates were highly consistent with
-> the original models across the full lag-response curve and across all
-> five exposure windows, supporting the stability and direction of the
-> observed associations. As expected given the small number of independent
-> climate-exposure series, however, confidence intervals widened
-> substantially under the cluster bootstrap, and a smaller portion of the
-> lag-response curve and trimester estimates remained nominally significant
-> at the 5% level. A leave-one-grid-cell-out analysis further confirmed that
-> no single grid cell was driving the overall result. We interpret these
-> findings as indicating that our point estimates are robust, but that the
-> precision of our inference is ultimately limited by the number of
-> independent spatial exposure series available -- an inherent constraint
-> of applying coarse-resolution climate reanalysis data to a geographically
-> compact cohort, and one shared by most studies of this design. We have
-> added this as an explicit limitation and a direction for future research
-> (e.g., multi-site cohorts spanning a wider climatic gradient, or
-> higher-resolution exposure products that could increase the number of
-> independent exposure series).
-
-
----
 
 ## Phase 2b — Proportional Odds Robustness (Referee 2, Comment 4)
-
-*Addresses three reviewer sub-points:*
 *(1) Brant test statistics in a formatted table*
 *(2) Partial proportional odds check — via binary DLNM comparison at each cutpoint*
 *(3) Binary outcome recoding (high stress vs. low/moderate)*
@@ -4052,22 +3796,6 @@ gtsave(
 )
 ```
 
-**How to interpret this for the response letter:**
-
-- The **WBGT rows** (highlighted) have Brant p-values ranging from 0.12 to 1.00 across all five
-  exposure windows — the PO assumption holds cleanly for the heat-exposure variable in every model.
-- The **omnibus test** is borderline significant in three models (Pre-Conception p=0.027,
-  First Trimester p=0.045, Entire Pregnancy p=0.049), but the full table shows this is driven
-  entirely by the education and marital status covariates, not WBGT.
-- **Covariate violations are not a problem for the primary inference**: they affect the
-  precision with which those covariates are modelled, not the WBGT exposure coefficient, which
-  sits in an otherwise correctly-specified part of the model.
-- **Sparse-cell footnote**: the Brant warning about empty cross-tabulation cells likely
-  originates from the Secondary high school group (n=13, 4%), which may produce empty
-  cells when crossed with both outcome categories and other covariates. This inflates
-  the omnibus type-I error, making it conservative to flag the covariate violations.
-  The single-continuous-predictor WBGT term is not affected by this issue.
-
 
 ### Part 2 — Partial PO check: binary DLNM comparison (primary DLNM)
 
@@ -4088,7 +3816,7 @@ gtsave(
 #
 # Under the proportional odds assumption, the WBGT lag-response CURVE
 # should be identical at both thresholds (and should match the polr
-# curve). Overlaying all three curves directly visualises whether PO
+# curve). Overlaying all three curves directly visualizes whether PO
 # holds for the WBGT effect across the full distributed-lag surface.
 #
 # Note: Binary DLNM 2 (high vs low+moderate) IS the binary recoding
@@ -4404,28 +4132,6 @@ gtsave(
 )
 ```
 
-**How to interpret this for the response letter:**
-
-- **The overlay plot** is the primary visual evidence. If the three lag-response curves
-  (polr, binary cut 1, binary cut 2) have similar shape and peak timing, PO holds for the
-  WBGT effect across the full distributed-lag surface. This is the DLNM-appropriate analogue
-  of the Brant test, which cannot be meaningfully applied to a 12-column crossbasis.
-- **The cumulative table** gives the numerical counterpart: if the ORs at each exposure
-  window are broadly consistent across the three models (within each other's CIs), this
-  confirms PO holds for the key summary estimates too.
-- **Why this is better than the Brant test for the DLNM**: the Brant test applied to the
-  crossbasis would test 12 basis-function columns separately — the p-values relate to
-  mathematical artefacts of the spline parameterisation, not to the WBGT exposure itself.
-  The binary DLNM comparison directly tests what the reviewer actually cares about: is the
-  shape of the heat-stress lag-response consistent regardless of which stress-severity
-  threshold is used?
-- If the "high vs low+moderate" binary DLNM curve (firebrick) has a similar shape and
-  magnitude to the polr curve (black), this simultaneously answers sub-point 3 ("try a
-  different way of setting up the variables"): the finding holds under binary recoding.
-
-
-"The one exception was the 25th percentile (cooler) pre-conception window, where the upper binary cutpoint (high vs low+moderate stress) showed an OR of 0.45 (0.25, 0.81), diverging from the ordinal model (OR 0.76, non-significant) and the lower binary cutpoint (OR 1.00). We interpret this with caution: the primary ordinal model shows no significant association at this window, the result is driven by a small cell count of high-stress participants (n=70) at a temperature below the median, and the three models converge closely at the windows generating the paper's primary conclusions (gestational days 135–156)."
-
 
 ### Part 3 — Binary outcome recoding: trimester-average models
 
@@ -4551,80 +4257,12 @@ gtsave(
 )
 ```
 
-**How to interpret this for the response letter:**
-
-- **If the ORs are similar across the three model types for a given window**
-  (e.g., polr OR ≈ binary cut1 OR ≈ binary cut2 OR), this directly demonstrates that
-  the PO assumption holds for WBGT in the trimester models — the effect of heat is
-  consistent whether we're predicting "any elevated stress" (mod+high vs low) or
-  "severe stress" (high vs low+mod).
-- **If the "high vs low+moderate" binary OR is similar in magnitude to the polr OR**,
-  this specifically answers the reviewer's sub-point 3 ("try a different way of setting
-  up the variables"): the result holds under binary recoding.
-- **If you see divergence** (e.g., cut2 OR notably different from cut1 OR or polr OR for
-  a particular window), that would indicate a genuine PO violation for WBGT in that window —
-  but the Brant test results above strongly suggest this will not be the case.
-
-
-### Draft response to Referee 2, Comment 4
-
-> We thank the reviewer for this request and agree it strengthens the paper's
-> methods transparency. We have added three supplemental analyses:
->
-> **(1) Brant test table.** Supplemental Table X presents the Brant test
-> statistic and p-value for each term in all five trimester-average models
-> (Supplemental_Brant_Full_Table) and a summary showing only the omnibus and
-> WBGT-exposure rows (Supplemental_Brant_Summary_Table). The PO assumption
-> holds for the WBGT exposure term in every model (p = 0·12 to 1·00). The
-> omnibus test is borderline significant in three models (p = 0·027–0·049);
-> inspection of per-term statistics confirms this is attributable to the
-> education and marital-status covariates, not to WBGT. We note that the
-> Brant test issued a sparse-cell warning for all models (some outcome ×
-> predictor combinations empty, likely from the small secondary-schooling
-> group, n = 13), which may inflate the omnibus type-I error; per-term WBGT
-> results are unaffected.
->
-> **(2) Partial proportional odds check.** For the trimester-average models, we
-> present binary logistic regressions at each outcome threshold alongside the
-> ordinal model estimates (Supplemental Table Y). ORs for WBGT are consistent
-> across both thresholds and the ordinal model in all five exposure windows,
-> confirming PO holds for the heat-exposure variable. For the primary DLNM,
-> the Brant test cannot be directly applied because the crossbasis
-> parameterisation produces 12 basis-function columns with no natural
-> per-column interpretation. We instead fit two binary logistic DLNMs at
-> each outcome threshold using the same crossbasis and covariates, and
-> overlay their lag-response curves with the primary polr DLNM curve
-> (Supplemental Figure Z). The three curves are [describe from output: e.g.,
-> broadly concordant in shape and magnitude / slightly divergent at
-> gestational days X–Y], providing [strong / adequate] evidence that the
-> proportional odds assumption holds for the WBGT lag-response surface.
->
-> **(3) Binary outcome recoding.** The "high stress vs. low/moderate stress"
-> binary recoding (Supplemental Tables X–Y) yields WBGT ORs consistent with
-> the ordinal model estimates across all five trimester windows and across
-> the primary DLNM lag-response curve, confirming that the findings are not
-> an artefact of the ordinal categorisation.
-
-
----
 
 ## Phase 2d — FDR-adjusted p-values for primary exposure-window family
 ### Referee 2, Comment 5: Multiple testing
 
 ```{r peer_review_fdr_adjustment}
 
-# -----------------------------------------------------------------------
-# Referee 2 Comment 5: Multiple testing correction
-#
-# The reviewer notes that with five exposure windows, multiple heat metrics,
-# and many lag values, some borderline findings may not survive correction.
-#
-# APPROACH (pre-registration framing):
-#   PRIMARY family   — max daily WBGT, ordinal polr, 5 windows
-#                      (pre-conception, T1, T2, T3, entire pregnancy)
-#   SECONDARY        — min WBGT, financial-domain model, same 5 windows
-#   EXPLORATORY      — alternative metrics (HI, T2m, Tw), DLNM lag timing
-#
 # We apply Benjamini-Hochberg (BH / FDR) correction only within the
 # primary family (5 tests). Bonferroni is also shown for comparison.
 # The `p.adjust()` function implements both.
@@ -4632,7 +4270,6 @@ gtsave(
 # Data source: `seasonal_sensitivity_tbl` built in the peer_review_seasonal_sensitivity
 # chunk. We filter to the "Season at delivery (original)" spec, which is
 # the primary model specification used throughout the paper.
-# -----------------------------------------------------------------------
 
 # ---- 1) Extract p-values for the primary 5-window family ----------------
 
@@ -4750,27 +4387,6 @@ cat("  Supplemental_FDR_Adjusted_Pvalues.rtf\n")
 cat("  Supplemental_FDR_Adjusted_Pvalues.png\n")
 ```
 
-### Interpretation
-
-The BH-FDR correction is applied only to the **five primary hypothesis tests** (pre-conception, T1, T2, T3, entire pregnancy × max WBGT × ordinal polr), which is the appropriate and defensible family for this reviewer comment. Key things to note:
-
-- If **First Trimester and/or Entire Pregnancy survive FDR**, these remain your headline findings under multiplicity correction and should be foregrounded in the Results and Abstract.
-- If **Second Trimester** (the borderline result the reviewer flagged at p ≈ 0.038) does **not** survive FDR, you should downgrade that finding explicitly: *"The second trimester association did not survive FDR correction (FDR-adjusted p = [value]) and should be interpreted cautiously."*
-- **Pre-Conception** is expected to be null and serves as an internal negative control — it should not survive FDR.
-- **Bonferroni** is shown for completeness; it will be more conservative. If your findings survive Bonferroni, mention that explicitly as it strengthens the response.
-
-Green-highlighted rows in the supplemental table = findings that survive FDR at α = 0.05.
-
-### Response-letter text for Referee 2, Comment 5
-
-> **Comment 5 (Multiple testing).** We thank the reviewer for raising this important point. We have addressed all three sub-points:
->
-> **(a) Pre-specification of primary hypotheses.** We have added a paragraph to the Methods section explicitly distinguishing primary, secondary, and exploratory analyses. We designated daily maximum WBGT as the primary heat exposure metric based on our a priori hypothesis that daytime heat burden is the mechanistically relevant exposure. The five ordinal logistic regression models for average maximum WBGT across prespecified exposure windows (pre-conception, trimester 1, trimester 2, trimester 3, and entire pregnancy) constitute our primary family of hypotheses. Analyses using daily minimum WBGT, domain-specific stress outcomes, and alternative heat metrics (HI, T2m, Tw) are treated as secondary or sensitivity analyses. DLNM lag-response curves are interpreted as exploratory characterisations of timing rather than confirmatory tests.
->
-> **(b) Multiplicity-adjusted p-values.** We computed Benjamini-Hochberg FDR-adjusted p-values for the five primary exposure-window tests (Supplemental Table [N]). [Describe which results survive FDR correction here based on the output above.] Results for secondary and exploratory analyses are reported without multiplicity adjustment but are explicitly labelled as such in the text.
->
-> **(c) Simultaneous confidence bands.** We acknowledge that pointwise 95% confidence bands for DLNM lag-response curves do not control for the family-wise error rate across all lags simultaneously. Following standard practice in the distributed lag literature (Gasparrini et al. 2010, 2014), we report pointwise 95% CIs and explicitly frame the DLNM as an exploratory characterisation of timing. We additionally display Scheffé-corrected simultaneous 95% confidence bands for the primary lag-response curves (Supplemental Figure [W]). These wider bands, which control the family-wise error rate across all 240 lags jointly, confirm that the broad mid-gestation pattern of increasing risk is not an artefact of pointwise testing, though individual lag-level significance cannot be claimed under simultaneous inference. The primary confirmatory tests — which exposure window matters and by how much — are addressed by the FDR-corrected trimester-average models (Supplemental Table [N]).
-
 
 ## Phase 2d (supplemental) — Simultaneous confidence bands for Figure 1
 ### Referee 2, Comment 5(c): Scheffé-corrected bands overlaid on lag-response curves
@@ -4782,9 +4398,9 @@ Green-highlighted rows in the supplemental table = findings that survive FDR at 
 # lag-response curves (Figure 1, panels A–D).
 #
 # BACKGROUND
-# Standard crosspred() CIs are *pointwise* 95% bands: at any single lag,
+# Standard crosspred() CIs are pointwise 95% bands: at any single lag,
 # there is a 5% chance the true value lies outside. When viewing the whole
-# curve across 240 lags, the probability of being outside *somewhere* is
+# curve across 240 lags, the probability of being outside somewhere is
 # much higher. Simultaneous bands correct for this.
 #
 # METHOD: Scheffé correction
@@ -4976,53 +4592,11 @@ cat("  Figure1_Simultaneous_Bands.pdf\n")
 cat("  Figure1_Simultaneous_Bands.png\n")
 ```
 
-### Interpretation
-
-The simultaneous Scheffé bands will be **substantially wider** than the pointwise bands — this is expected and is the honest answer to the reviewer's concern. Key things to note:
-
-- The **critical value ratio** printed above (z_sim / z_pt ≈ 2.3×) tells you exactly how much wider the bands are. At n ≈ 312 with 12 crossbasis parameters, this ratio is typically around 2.3–2.5.
-- Panels **C and D** (75th and 99th percentile) are most likely to retain some visual separation from OR = 1 under simultaneous inference in the mid-gestation period (days 120–180), given those are your strongest effects.
-- The point estimates (black line) are **identical** to Figure 1 — only the bands change.
-- For your PI meeting: show both the original Figure 1 and this supplemental version side by side. The comparison makes a concrete visual case for why the DLNM is best interpreted as exploratory timing characterisation, not as a test at individual lags.
-
-"(c) Simultaneous confidence bands. We display Scheffé-corrected simultaneous 95% confidence bands for the primary DLNM lag-response curves (Supplemental Figure [W]). As expected for a crossbasis with 12 parameters at this sample size, the simultaneous bands are approximately 2.3× wider than the pointwise bands and cross OR = 1 at all individual lags. This is consistent with our treatment of the DLNM as an exploratory characterisation of gestational timing rather than a confirmatory multi-lag test. Formal confirmatory inference is conducted via the trimester-average ordinal models, for which FDR-adjusted p-values are provided (Supplemental Table [N]) and the primary findings survive even the conservative Bonferroni correction."*
-
-
----
 
 ## Phase 2e — DLNM specification sensitivity grid
 ### Referee 2, Comment 6: Model selection transparency
 
 ```{r peer_review_dlnm_spec_grid}
-
-# -----------------------------------------------------------------------
-# Referee 2 Comment 6: The reviewer is concerned that model selection from
-# "roughly 100 model setups" introduced outcome-dependent specification.
-#
-# RESPONSE STRATEGY (three sub-tables in one supplemental table):
-#
-#   Part A — df sensitivity grid
-#     Refit the DLNM at each specification considered in model_selection.Rmd:
-#     {var_df = 2,3,4,5} × {lag_df = 2,3} for the primary max-WBGT outcome.
-#     Report: BIC, and cumulative OR (95% CI) at the two primary windows
-#     (99th pctile vs median, days 135–141 and days 150–156).
-#     Selected model (df=4, lag=3) is highlighted.
-#
-#   Part B — reference-point sensitivity
-#     Refit the selected model (df=4, lag=3) with three reference values:
-#     25th, 50th (median, primary), and 75th percentile.
-#     Report cumulative OR at the same two windows.
-#     Under PO the direction should be consistent; only the magnitude changes
-#     because OR is always relative to the chosen reference.
-#
-#   Part C — cumulative window length sensitivity
-#     Keep selected model and median reference. Vary the window length:
-#     3-day, 7-day (primary), and 14-day windows, all centred on gestational
-#     days 138 (midpoint of the 135–141 peak) and 153 (midpoint of 150–156).
-#     Report cumulative OR (95% CI) for each length.
-#
-# All three sub-tables are combined into one gt with tab_spanners.
-# -----------------------------------------------------------------------
 
 # ---- Shared setup -------------------------------------------------------
 # Data and lag range (reuse _fig1 variables from Phase 2a onwards)
@@ -5292,42 +4866,6 @@ gtsave(part_c_gt,
 
 cat("\nAll 6 files saved (3× RTF, 3× PNG).\n")
 ```
-
-### Interpretation
-
-**Part A (df grid):** Look at whether the two primary windows (days 135–141 and 150–156) show consistent direction of ORs > 1 across all 7 specifications. The selected model (highlighted in yellow) should have the lowest or near-lowest BIC. Minor variation in magnitude across specs is expected and acceptable — what matters is that the direction and approximate magnitude are stable.
-
-Prior to committing to natural splines, we conducted an initial exploratory search across B-spline specifications (degree 2–5, df 3–6, 9 combinations). Natural spline models achieved comparable or lower BIC across all df values tested and were subsequently selected as the basis family for the pre-specified sensitivity grid, because natural splines enforce linearity at the boundaries of the observed exposure distribution — a biologically conservative constraint that avoids implausible extrapolation at extreme WBGT values."
-
-
-
-**Part B (reference sensitivity):** The OR *scale* will differ across reference choices (comparing 99th vs. 25th gives a larger OR than 99th vs. 50th, because you're spanning a bigger temperature range). What matters for the reviewer is that the **direction** (OR > 1) is consistent regardless of reference, and that no specification makes the finding disappear. Note this in the response letter explicitly.
-
-**Part C (window length):** A 3-day window will have a smaller cumulative OR than 14-day (fewer lags summed). The key question is whether significance is retained across window lengths. If the 7-day and 14-day windows show similar patterns but the 3-day is noisier, that supports the 7-day choice as a reasonable balance between precision and stability.
-
-### Response-letter text for Referee 2, Comment 6
-
-> **Comment 6 (Model selection transparency).** We thank the reviewer for this request. We address each sub-point:
->
-> **(1) Pre-specified df ranges.** The phrase "roughly 100 different model setups" was imprecise and we have revised the Methods text accordingly. We evaluated a pre-specified grid of natural spline specifications: exposure df ∈ {2, 3, 4, 5} and lag df ∈ {2, 3}, giving 7 candidate models. Model selection used BIC as a guide alongside visual inspection of curve smoothness and biological interpretability — a combination recommended for DLNM specification (Gasparrini 2011). We did not select the model with the lowest BIC (exposure df = 2, lag df = 2; ΔBIC = −35 vs. selected model), because a 2-df natural spline for exposure and 2-df spline for lag produces a near-linear lag surface with only one internal knot in each dimension. Such a model cannot identify *which* gestational period carries the effect — the primary scientific question motivating use of a DLNM — and risks averaging real temporal heterogeneity into a single slope. The selected model (df = 4, lag = 3) was the most parsimonious specification that produced smooth, non-oscillating exposure and lag-response surfaces while retaining sufficient flexibility to characterise gestational timing (Figure S1). Critically, all 7 candidate specifications consistently showed OR > 1 at the two primary peak gestational windows, confirming the directional finding is not an artefact of the chosen specification (Supplemental Table [A]).
->
-> **(2) Reference point.** We used the median WBGT as the reference because it is the central, best-supported value in the observed exposure distribution, minimising extrapolation at both tails. Sensitivity analyses using the 25th and 75th percentiles as alternative reference values produced the same qualitative conclusion — positive associations at gestational days 135–156 — with expected differences in OR magnitude reflecting the different temperature contrasts being compared (Supplemental Table [B]).
->
-> **(3) Cumulative window length.** Seven-day windows were chosen to capture a short but physiologically meaningful period of sustained heat exposure, avoiding both single-day noise (3-day) and excessive temporal averaging that could dilute peak effects (14-day). Sensitivity analyses using 3-day and 14-day windows centred on the same gestational periods produced qualitatively consistent results (Supplemental Table [C]).
-
-
----
-
-The regression analysis explores the association between wet bulb globe temperature (WBGT) and stress using the Sum NDS Category during different periods of pregnancy. The results indicate that:
-
--   **Entire Pregnancy**: Higher average daily maximum WBGT during the entire pregnancy is significantly associated with belonging to a higher stress group, with a one degree increase in WBGT associated with a 55.7% increase in the odds of belonging to a higher stress group (p = 0.004).
-
--   **Pre-Conception**: Higher average daily maximum WBGT during the pre-conception period is significantly associated with belonging to a higher stress group, with a one degree increase in WBGT associated with a 19.3% increase in the odds of belonging to a higher stress group (p = 0.038).
-
--   **Trimester-Specific Averages**:  Higher average daily maximum WBGT during the first trimester is significantly associated with belonging to a higher stress group, with a one degree increase in WBGT associated with a 35.1% increase in the odds of belonging to a higher stress group (p = 0.002). While the second trimester showed a positive association between temperature and Sum NDS Category, the effect was not significant. The third trimester average showed no effect, indicating that the temperatures nearest to the survey date appear less strongly associated with the Sum NDS Category.  
-
-
-
 
 
 # Distributions of Data
