@@ -1,0 +1,38 @@
+# ---- Data: never commit GRAPHS individual-level data ----
+data/
+*.csv
+*.xlsx
+*.xls
+*.dta
+*.sas7bdat
+*.RData
+*.rds
+*.zip
+
+# ---- R session / project cruft ----
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# ---- renv library (keep renv.lock, ignore the installed library) ----
+renv/library/
+renv/local/
+renv/cellar/
+renv/staging/
+
+# ---- Knitr / rmarkdown intermediates ----
+*_cache/
+*_files/
+*.knit.md
+*.utf8.md
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*~
+~$*
+
+# ---- Outputs (uncomment if you do NOT want to share generated figures) ----
+# outputs/

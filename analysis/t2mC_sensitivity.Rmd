@@ -1,0 +1,2346 @@
+---
+title: "Tables and Figures DLNM"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 6
+    toc_float: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# Load necessary libraries
+library(readxl)     # reading Excel files
+library(tidyverse)      # data manipulation
+library(labelled)   # labeling columns 
+library(here) # file paths
+library(haven)
+library(stargazer)
+library(dlnm)
+library(data.table)
+library(forcats) # For reordering factor levels
+library(broom)
+library(MASS)
+library(brant) # test proportional odds assumption for ordinal logistic regression
+library(gt)
+library(patchwork)
+# source in code to load and clean data
+
+## override mass::select and use dplyr as default
+select <- dplyr::select 
+
+source(here("data_cleaning", "clean_stress_data.R")) # pss_recode and crisis_recode are the output datasets of interest
+
+
+
+# load selected temp data
+era5 <- read_csv(here("data", "GRAPHS-ERA5-CHIRPS", "GRAPHS-ERA5-Heatstress-Tw-1991missing.csv")) %>%
+  filter(date > as.Date("2013-01-01")) %>%
+  mutate(community = case_when(community == "AKORA/AT" ~ "AKORA",
+                               TRUE ~ community)) %>%
+  mutate(t2mC_delta = max_t2mC - min_t2mC)
+
+# load in precip data 
+precip <- read_csv(here("data", "GRAPHS-ERA5-CHIRPS", "GRAPHS-CHIRPS-Precip.csv")) 
+
+precip_clean <- precip %>%
+  select(community, date, precip) %>%
+  filter(date > as.Date("2013-01-01")) %>%
+  mutate(date = lubridate::ymd(date),
+         month = lubridate::month(date))%>%
+  mutate(community = case_when(community == "AKORA/AT" ~ "AKORA",
+                               TRUE ~ community))
+
+# check definition of rainy season 
+precip_summary <- precip_clean %>%
+  group_by(month) %>%
+  summarise(total_precip = sum(precip))
+
+
+# load selected temp data
+t2mC_daily_max <- era5 %>%
+  dplyr::select(community, date, max_t2mC)  # select relevant columns
+
+t2mC_daily_mean <- era5 %>%
+  dplyr::select(community, date, mean_t2mC)  # select relevant columns
+
+t2mC_daily_min <- era5 %>%
+  dplyr::select(community, date, min_t2mC)  # select relevant columns
+
+```
+
+
+
+## Sum NDS Category
+
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+### LOAD THE CRYSIS DATA
+
+## CRYSIS data
+crisis_simple <- crisis_recode %>%
+  mutate(
+    quessetdt = sprintf("%04d", quessetdt),  # Ensure quassetdt has 4 digits
+    quessetdt = sub("(\\d{2})(\\d{2})", "\\1:\\2", quessetdt),  # Insert colon
+    survey_datetime = as.POSIXct(paste(quessetd, quessetdt), format = "%Y-%m-%d %H:%M")) %>%
+    select(mstudyid, fin_events:survey_datetime, neg_fin_groups, neg_rel_groups, neg_home_groups, datdeliv:survey_pre_post_birth, gestage_days, date_conception, married, wealthindex, age, bmi, medlev, fan, pregchn) %>%
+  select(-c(crireadneg:crikidneg)) %>%
+  mutate(month_delivery = lubridate::month(datdeliv),
+         season_delivery = case_when(month_delivery %in% c(4,5,6,7,8,9,10) ~ "wet", 
+                                     month_delivery %in% c(1,2,3,11,12) ~"dry",
+                                     TRUE ~ NA)) %>%
+  
+  mutate(married_bin = case_when(
+      married %in% c(1, 2) ~ "partnered",
+      married %in% c(3, 4, 5, 6) ~ "not_partnered",
+      TRUE ~ NA_character_
+    ),
+    married_bin = factor(married_bin)) %>%
+  
+  mutate(medlev_bin = case_when(
+      medlev == 1 ~ "None",
+      medlev == 2 ~ "Primary",
+      medlev %in% c(3, 4) ~ "≥ JHS",
+      TRUE ~ NA_character_
+    ),
+    medlev_bin = factor(medlev_bin)) %>%
+  
+  mutate(survey_date = as.Date(survey_datetime))  # Extract the date part of survey_datetime
+
+
+```
+
+
+### Max t2mC
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+
+## Create Daily Lag Frame:
+max_gestation_days <- 210 ## Two weeks into third trimester. This was chosen to avoid post-survey exposure while keeping the full second trimester and sample size. Went two weeks into third trimester so estimates in second trimester more stable, as DLNMs uncertain at edge periods. 
+
+pre_conception_days <- 30
+
+crisis_dlnm_eligible <- crisis_simple %>% 
+  filter(gestage_at_survey >= max_gestation_days) %>% # filter 
+  filter(!is.na(bmi))
+
+
+# Function to process temperature data for the selected metric
+process_temperature_data <- function(era5_data, metric) {
+  era5_data %>%
+    select(community, date, !!sym(metric)) %>%
+    rename(temp_metric = !!sym(metric)) %>%
+    distinct()
+}
+
+# Process temp data
+temp_data_clean <- process_temperature_data(era5_data = era5, metric = "max_t2mC")
+
+
+
+# Generate lags relative to conception
+create_conception_aligned_lags <- function(df, temp_df) {
+  df %>%
+    select(mstudyid, vname, date_conception) %>%
+    rowwise() %>%
+    mutate(day_relative = list(-pre_conception_days:max_gestation_days),
+           date = list(date_conception + day_relative)) %>%
+    unnest(c(day_relative, date)) %>%
+    left_join(temp_df, by = c("vname" = "community", "date" = "date"))  # join temp
+}
+
+
+temp_lags_long <- create_conception_aligned_lags(crisis_dlnm_eligible, temp_data_clean)
+
+# Step 4: Pivot to wide format (like DLNM expects)
+temperature_lags_wide <- temp_lags_long %>%
+  select(mstudyid, date_conception, day_relative, temp_metric) %>%
+  pivot_wider(
+    names_from = day_relative,
+    values_from = temp_metric,
+    names_prefix = "day_"
+  ) %>%
+  left_join(crisis_dlnm_eligible %>% select(mstudyid, sum_nds_category, neg_fin_groups, neg_rel_groups, neg_home_groups, age, bmi, wealthindex, pregchn, season_delivery, married_bin, medlev_bin), by = "mstudyid") %>%
+  filter(!is.na(day_0))
+
+temp_data_matrix <- temperature_lags_wide %>%
+  select(starts_with("day_")) %>%
+  as.matrix()
+
+```
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# set up DLNM model parameters, fit model, and get predictions
+
+## SET UP PARAMS
+
+# predictor DLNM model parameters -- captures the relationship between the predictor variable (temp) and the outcome
+var_arg = list(fun = "ns", df = 4) # smooth cubic polynomial (degree = 3) between the boundary knots
+
+# lag DLNM model parameters -- captures the lagged effects of the predictor variable (temp) over time.
+lag_arg = list(fun = "ns", df = 3) # smooth cubic polynomial (degree = 3) between the boundary knots 
+
+# cross-basis matrix for DLNM
+cb = crossbasis(temp_data_matrix, lag = c(0, ncol(temp_data_matrix) - 1), argvar = var_arg, arglag = lag_arg) # basis for the predictor and lag 
+
+# ordered logistic regression model
+model_polr <- polr(
+  formula = sum_nds_category ~ cb + age + bmi + wealthindex + season_delivery + pregchn + married_bin + medlev_bin,
+  data = temperature_lags_wide,
+  method = "logistic" 
+)
+
+
+# GET PREDICTIONS (in reference to median temp)
+temp_median <- round(median(as.vector(temp_data_matrix)), 1) # centering value (median). 
+crysis_temp_median <- temp_median
+
+# generate predictions for a DLNM, set centering value as the median of all temperatures
+cpred = crosspred(cb, 
+                  model_polr, 
+                  ci.level = 0.95, # 95% confidence intervals calculated around predicted values
+                  cen = temp_median, # predictions are relative to this baseline temperature.
+                  by = 0.1) # predictions are generated at intervals of 0.1 units of temperature
+
+
+
+png(here("outputs", "contour_max_t2mC.png"), width = 8, height = 6, units = "in", res = 300)
+
+par(mar = c(4.8, 5.6, 2.2, 6.2))  # bottom, left, top, right
+
+plot(cpred, "contour",
+     xlab = "Max temperature (°C)",
+     ylab = "Days relative to conception (0 = 30 days preconception)",
+     key.title = title(main = "Change in \nlog odds", cex.main = 0.8))
+
+
+dev.off()
+```
+
+
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+plot_lag_effect_for_percentile <- function(cpred, percentile, temp_data_matrix, temp_median,
+                                           xlab = "Days Relative to Conception (0 = 30 Days Before)",
+                                           ylab = "Change in Log Odds of Higher Stress Category",
+                                           main = NULL, tag = NULL) {
+  # nearest value on cpred grid
+  temp_value <- round(quantile(as.vector(temp_data_matrix), percentile/100, na.rm=TRUE), 1)
+  row_vals <- as.numeric(rownames(cpred$matfit))
+  idx <- which.min(abs(row_vals - temp_value))
+  used_val <- row_vals[idx]
+
+  matfit <- cpred$matfit[idx, ]; matlow <- cpred$matlow[idx, ]; mathigh <- cpred$mathigh[idx, ]
+  names(matfit) <- names(matlow) <- names(mathigh) <- sub("^lag", "", names(matfit))
+  lags <- as.numeric(names(matfit))
+
+  if (is.null(main)) {
+    main <- paste0("Effect of ", used_val, "°C (", percentile, "th) vs median (", temp_median, "°C)")
+  }
+
+  plot(lags, matfit, type="l", lwd=2,
+       ylim=range(c(matlow, mathigh), na.rm=TRUE),
+       xlab=xlab, ylab=ylab, main=main)
+  polygon(c(lags, rev(lags)), c(mathigh, rev(matlow)),
+          col=rgb(0,0,0,0.2), border=NA)
+  abline(h=0, lty=2)
+
+  if (!is.null(tag)) mtext(tag, side=3, adj=0, line=0.2, font=2, cex=1.1)
+
+  invisible(invisible(NULL))
+}
+
+
+plot_lag_effect_for_percentile(cpred,   1,  temp_data_matrix,   temp_median, main="A: Effect of 22.4°C (1st) vs median (27.4°C)")
+
+
+
+# Plot for 1st, 25th, 75th, and 99th percentiles
+plot_lag_effect_for_percentile(cpred, 1, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 25, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 75, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 99, temp_data_matrix, temp_median)
+```
+
+
+
+
+```{r}
+# helper: add ordinal suffix (1 -> 1st, 2 -> 2nd, etc.)
+ordinal <- function(n){
+  if (n %% 100L %in% c(11L,12L,13L)) return(paste0(n,"th"))
+  c("th","st","nd","rd","th")[pmin(5, (n %% 10L)+1)] |>
+    (\(suf) paste0(n, suf))()
+}
+
+# build a slice dataframe for a given percentile
+slice_df <- function(cpred, percentile, exposure_matrix, center_val){
+  
+  # find temp values to slice at
+  at_val  <- as.numeric(quantile(as.vector(exposure_matrix), percentile/100, na.rm = TRUE))
+  rows    <- as.numeric(rownames(cpred$matfit))
+  idx     <- which.min(abs(rows - at_val))
+  used    <- rows[idx]
+  
+  # extract predictions
+  fit     <- cpred$matfit[idx, ] 
+  low <- cpred$matlow[idx, ] 
+  high <- cpred$mathigh[idx, ]
+  
+  # extract lags 
+  lags    <- if (all(grepl("^lag", names(fit)))) {
+    as.numeric(sub("^lag","",names(fit))) 
+    } else {
+      seq_along(fit)-1
+    }
+  
+  # build tibble + exponentiate for odds ratios
+  tibble(lag = lags,
+         effect = as.numeric(fit),
+         ci_low = as.numeric(low),
+         ci_high = as.numeric(high),
+         OR = exp(fit),
+         OR_low  = exp(low),
+         OR_high = exp(high),
+         used_val = used,
+         center_val = center_val,
+         pct = percentile)
+}
+
+library(ggplot2)
+library(patchwork)
+library(grid)
+
+# one panel with in-plot annotations
+make_slice_panel_or <- function(df, letter){
+
+  ann_top <- letter
+  ann_sub <- sprintf("%.1f°C (%s) vs median (%.1f°C)",
+                     df$used_val[1], ordinal(df$pct[1]), df$center_val[1])
+
+  ggplot(df, aes(lag, OR)) +
+    geom_ribbon(aes(ymin = OR_low, ymax = OR_high), alpha = 0.20) +
+    geom_line(size = 0.8) +
+    geom_hline(yintercept = 1, linetype = 2) +
+    annotate("text", x = -Inf, y = Inf, label = ann_top,
+             hjust = -0.5, vjust = 0.75, fontface = "bold", size = 5) +
+    annotate("text", x = -Inf, y = Inf, label = ann_sub,
+             hjust = -0.5, vjust = 2.4, size = 3.5) +
+    labs(x = "Days Relative to Conception (0 = 30 Days Before)",
+         y = "Odds Ratio (higher stress category)") +
+    scale_x_continuous(
+      limits = c(0, 250),
+      breaks = c(0, 30, 60, 90, 120, 150, 180, 210, 240),
+      labels = c("-30", "0", "30", "60", "90", "120", "150", "180", "210")) +
+    geom_vline(xintercept = 30, linetype = 3, color = "black", linewidth = 0.4) +
+    coord_cartesian(clip = "off") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.margin = margin(10, 12, 6, 12),
+      plot.title = element_blank(),
+      axis.text = element_text(size = 11.5, color = "black"),
+      axis.title = element_text(size = 12.5, color = "black")
+    ) 
+}
+
+
+## ---------- Build the four MAX (adjusted for Δ) panels ----------
+A <- make_slice_panel_or(slice_df(cpred, 1, temp_data_matrix, temp_median), "A") + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+B <- make_slice_panel_or(slice_df(cpred, 25, temp_data_matrix, temp_median), "B")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+C <- make_slice_panel_or(slice_df(cpred, 75, temp_data_matrix, temp_median), "C")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+D <- make_slice_panel_or(slice_df(cpred, 99, temp_data_matrix, temp_median), "D")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+p_max <- (A + B) / (C + D) +
+  plot_layout(guides = "collect", heights = c(1, 1)) &
+  theme(plot.margin = margin(t = 5, r = 5, b = 10, l = 10))  # ← increase b (bottom)
+
+# Save to high-resolution PNG
+#png(here("outputs", "Figure1_Maxt2mC.png"), width = 9, height = 6, units = "in", res = 600)
+
+pdf(here("outputs", "Figure_S9.pdf"),
+    width = 8, height = 6)
+
+
+# Draw your combined figure
+print(p_max)
+
+# Add shared x/y labels
+grid::grid.text("Days relative to conception (0 = conception)",
+                y = unit(0.015, "npc"), gp = grid::gpar(fontsize = 12))
+grid::grid.text("Odds ratio (higher stress category)",
+                rot = 90, x = unit(0.015, "npc"),
+                gp = grid::gpar(fontsize = 12.5))
+
+# Close the graphics device — this actually writes the file
+dev.off()
+
+```
+
+
+```{r}
+## pull out specific day windows where there is significance to mention in paper
+slice_25 <- slice_df(cpred, 25, temp_data_matrix, temp_median)
+
+sig_25 <- slice_25 %>%
+  filter(OR_low > 1 | OR_high < 1)
+
+sig_25
+
+slice_99 <- slice_df(cpred, 99, temp_data_matrix, temp_median)
+
+sig_99 <- slice_99 %>%
+  filter(OR_low > 1 | OR_high < 1)
+
+sig_99
+```
+
+
+```{r}
+
+temp_w_season <- temp_lags_long %>%
+  mutate(
+    month  = month(date),
+    season = case_when(
+      month %in% 4:10 ~ "wet",
+      month %in% c(1,2,3,11,12) ~ "dry",
+      TRUE ~ NA_character_
+    ),
+    season = factor(season, levels = c("dry", "wet"))
+  )
+
+make_density_df <- function(df, group_vars = c("mstudyid")) {
+  df %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(dens = list(density(temp_metric, na.rm = TRUE)), .groups = "drop") %>%
+    mutate(x = map(dens, "x"),
+           y = map(dens, "y")) %>%
+    unnest(c(x, y))
+}
+
+
+# overall per-person
+density_overall <- make_density_df(temp_w_season, group_vars = c("mstudyid"))
+
+# dry per-person
+density_dry <- make_density_df(filter(temp_w_season, season == "dry"),
+                               group_vars = c("mstudyid"))
+
+# wet per-person
+density_wet <- make_density_df(filter(temp_w_season, season == "wet"),
+                               group_vars = c("mstudyid"))
+
+# pop (overall)
+pop_overall <- {
+  d <- density(temp_w_season$temp_metric, na.rm = TRUE)
+  tibble(x = d$x, y = d$y)
+}
+
+# pop (dry / wet)
+pop_dry <- {
+  d <- density(filter(temp_w_season, season == "dry")$temp_metric, na.rm = TRUE)
+  tibble(x = d$x, y = d$y)
+}
+
+pop_wet <- {
+  d <- density(filter(temp_w_season, season == "wet")$temp_metric, na.rm = TRUE)
+  tibble(x = d$x, y = d$y)
+}
+
+# percentiles (overall to match DLNM)
+qs <- quantile(
+  temp_w_season$temp_metric,
+  probs = c(0.01, 0.25, 0.5, 0.75, 0.99),
+  na.rm = TRUE
+)
+
+# shared x-limits so panels are comparable
+xlims <- range(temp_w_season$temp_metric, na.rm = TRUE)
+
+
+make_panel <- function(density_df, pop_df, x_label = NULL) {
+  ggplot(density_df, aes(x = x, y = y, group = mstudyid)) +
+    geom_line(color = "black", alpha = 0.05, linewidth = 0.4) +
+    geom_line(data = pop_df, aes(x = x, y = y),
+              inherit.aes = FALSE,
+              color = "black", linewidth = 1.1) +
+    geom_vline(
+      xintercept = qs[c("1%", "25%", "75%", "99%")],
+      color = "red3",
+      linetype = "dashed",
+      linewidth = 0.6
+    ) +
+    geom_vline(
+      xintercept = qs["50%"],
+      color = "red",
+      linetype = "solid",
+      linewidth = 0.9
+    ) +
+    geom_hline(yintercept = 0, color = "grey80", linewidth = 0.4) +
+    coord_cartesian(xlim = xlims) +
+    labs(x = x_label, y = "Density") +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.line  = element_line(linewidth = 0.9, color = "black"),
+      axis.ticks = element_line(linewidth = 0.6, color = "black")
+    )
+}
+
+
+p_overall <- make_panel(density_overall, pop_overall, x_label = NULL) +
+  ggtitle("A. Full exposure window")
+
+p_dry <- make_panel(density_dry, pop_dry, x_label = NULL) +
+  ggtitle("B. Dry season")
+
+p_wet <- make_panel(density_wet, pop_wet, x_label = "Daily Maximum T2m (°C)") +
+  ggtitle("C. Wet season")
+
+library(patchwork)
+
+full_temp_dist_plot <- (p_overall / p_dry / p_wet) +
+  plot_layout(heights = c(1, 1, 1))
+
+
+ggsave(here("outputs", "figureS3_t2m_density_plot.png"),
+       full_temp_dist_plot, 
+       width = 6, 
+       height = 9, 
+       dpi = 400)
+```
+
+
+
+
+#### Financial Negative Event 
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# set up DLNM model parameters, fit model, and get predictions
+
+## SET UP PARAMS
+
+# predictor DLNM model parameters -- captures the relationship between the predictor variable (temp) and the outcome
+var_arg = list(fun = "ns", df = 4) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# lag DLNM model parameters -- captures the lagged effects of the predictor variable (temp) over time.
+lag_arg = list(fun = "ns", df = 3) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# cross-basis matrix for DLNM
+cb = crossbasis(temp_data_matrix, lag = c(0, ncol(temp_data_matrix) - 1), argvar = var_arg, arglag = lag_arg) # basis for the predictor and lag 
+
+# ordered logistic regression model
+model_polr <- polr(
+  formula = neg_fin_groups ~ cb + age + bmi + wealthindex + season_delivery + pregchn + married_bin + medlev_bin,
+  data = temperature_lags_wide,
+  method = "logistic" 
+)
+
+
+# GET PREDICTIONS (in reference to median temp)
+temp_median <- round(median(as.vector(temp_data_matrix)), 1) # centering value (median). 
+crysis_temp_median <- temp_median
+
+# generate predictions for a DLNM, set centering value as the median of all temperatures
+cpred = crosspred(cb, 
+                  model_polr, 
+                  ci.level = 0.95, # 95% confidence intervals calculated around predicted values
+                  cen = temp_median, # predictions are relative to this baseline temperature.
+                  by = 0.1) # predictions are generated at intervals of 0.1 units of temperature
+
+
+# plot contour map of 3d plot
+plot(
+  cpred, 
+  "contour", 
+  main = paste0("Effects of Temperature and Lag on Log Odds \nof Higher Financial Stress Category Relative \nto Median Max Temperature (",temp_median, "°C)"), 
+  xlab = "Max Temperature (°C)", 
+  ylab = "Days Relative to Conception (0 = 30 Days Before)", 
+  key.title = title(main = "Change in \nLog Odds", cex.main = 0.8)
+)
+```
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# Plot for 1st, 25th, 75th, and 99th percentiles
+plot_lag_effect_for_percentile(cpred, 1, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 25, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 75, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 99, temp_data_matrix, temp_median)
+```
+
+
+```{r}
+
+## ---------- Build the four MAX (adjusted for Δ) panels ----------
+A <- make_slice_panel_or(slice_df(cpred, 1, temp_data_matrix, temp_median), "A") + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+B <- make_slice_panel_or(slice_df(cpred, 25, temp_data_matrix, temp_median), "B")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+C <- make_slice_panel_or(slice_df(cpred, 75, temp_data_matrix, temp_median), "C")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+D <- make_slice_panel_or(slice_df(cpred, 99, temp_data_matrix, temp_median), "D")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+p_max <- (A + B) / (C + D) +
+  plot_layout(guides = "collect", heights = c(1, 1)) &
+  theme(plot.margin = margin(t = 5, r = 5, b = 10, l = 10))  # ← increase b (bottom)
+
+# Save to high-resolution PNG
+png(here("outputs", "FigureS8_financial_Maxt2mC.png"), width = 9, height = 6, units = "in", res = 600)
+
+# Draw your combined figure
+print(p_max)
+
+# Add shared x/y labels
+grid::grid.text("Days relative to conception (0 = conception)",
+                y = unit(0.015, "npc"), gp = grid::gpar(fontsize = 12))
+grid::grid.text("Odds ratio (higher stress category)",
+                rot = 90, x = unit(0.01, "npc"), gp = grid::gpar(fontsize = 12))
+
+# Close the graphics device — this actually writes the file
+dev.off()
+```
+
+#### Relationship Negative Event 
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# set up DLNM model parameters, fit model, and get predictions
+
+## SET UP PARAMS
+
+# predictor DLNM model parameters -- captures the relationship between the predictor variable (temp) and the outcome
+var_arg = list(fun = "ns", df = 4) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# lag DLNM model parameters -- captures the lagged effects of the predictor variable (temp) over time.
+lag_arg = list(fun = "ns", df = 3) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# cross-basis matrix for DLNM
+cb = crossbasis(temp_data_matrix, lag = c(0, ncol(temp_data_matrix) - 1), argvar = var_arg, arglag = lag_arg) # basis for the predictor and lag 
+
+# ordered logistic regression model
+model_polr <- polr(
+  formula = neg_rel_groups ~ cb + age + bmi + wealthindex + season_delivery + pregchn + married_bin + medlev_bin,
+  data = temperature_lags_wide,
+  method = "logistic" 
+)
+
+
+# GET PREDICTIONS (in reference to median temp)
+temp_median <- round(median(as.vector(temp_data_matrix)), 1) # centering value (median). 
+crysis_temp_median <- temp_median
+
+# generate predictions for a DLNM, set centering value as the median of all temperatures
+cpred = crosspred(cb, 
+                  model_polr, 
+                  ci.level = 0.95, # 95% confidence intervals calculated around predicted values
+                  cen = temp_median, # predictions are relative to this baseline temperature.
+                  by = 0.1) # predictions are generated at intervals of 0.1 units of temperature
+
+
+# plot contour map of 3d plot
+plot(
+  cpred, 
+  "contour", 
+  main = paste0("Effects of Temperature and Lag on Log Odds \nof Higher Relationship Stress Category Relative \nto Median Max Temperature (",temp_median, "°C)"), 
+  xlab = "Max Temperature (°C)", 
+  ylab = "Days Relative to Conception (0 = 30 Days Before)", 
+  key.title = title(main = "Change in \nLog Odds", cex.main = 0.8)
+)
+```
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# Plot for 1st, 25th, 75th, and 99th percentiles
+
+plot_lag_effect_for_percentile(cpred, 1, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 25, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 75, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 99, temp_data_matrix, temp_median)
+```
+
+
+```{r}
+slice_99 <- slice_df(cpred, 99, temp_data_matrix, temp_median)
+
+sig_99 <- slice_99 %>%
+  filter(OR_low > 1 | OR_high < 1)
+
+sig_99
+```
+
+
+
+#### Home Negative Event 
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# set up DLNM model parameters, fit model, and get predictions
+
+## SET UP PARAMS
+
+# predictor DLNM model parameters -- captures the relationship between the predictor variable (temp) and the outcome
+var_arg = list(fun = "ns", df = 4) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# lag DLNM model parameters -- captures the lagged effects of the predictor variable (temp) over time.
+lag_arg = list(fun = "ns", df = 3) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# cross-basis matrix for DLNM
+cb = crossbasis(temp_data_matrix, lag = c(0, ncol(temp_data_matrix) - 1), argvar = var_arg, arglag = lag_arg) # basis for the predictor and lag 
+
+
+# ordered logistic regression model
+model_glm <- glm(
+  neg_home_groups ~ cb + age + bmi + wealthindex + season_delivery + pregchn + married_bin + medlev_bin,
+  data   = temperature_lags_wide,
+  family = binomial(link = "logit")
+)
+
+
+# GET PREDICTIONS (in reference to median temp)
+temp_median <- round(median(as.vector(temp_data_matrix)), 1) # centering value (median). 
+crysis_temp_median <- temp_median
+
+# generate predictions for a DLNM, set centering value as the median of all temperatures
+cpred <- crosspred(
+  cb,
+  model_glm,
+  ci.level = 0.95,
+  cen = temp_median,
+  by = 0.1,
+)
+
+# plot contour map of 3d plot
+plot(
+  cpred, 
+  "contour", 
+  main = paste0("Effects of Temperature and Lag on Odds Ratio \nof Home Stress Relative \nto Median Max Temperature (",temp_median, "°C)"), 
+  xlab = "Max Temperature (°C)", 
+  ylab = "Days Relative to Conception (0 = 30 Days Before)", 
+  key.title = title(main = "Odds ratio \n(vs median)", cex.main = 0.8)
+)
+```
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# --- Helpers (RR scale only) -----------------------------------------------
+
+.get_rr <- function(cpred) {
+  if (is.null(cpred$matRRfit) || is.null(cpred$matRRlow) || is.null(cpred$matRRhigh)) {
+    stop("cpred does not contain RR matrices. Re-run crosspred() normally (no 'type=' arg).")
+  }
+  list(fit = cpred$matRRfit, low = cpred$matRRlow, high = cpred$matRRhigh)
+}
+
+.closest_row <- function(row_names_num, target) {
+  # returns index of closest row by numeric distance
+  which.min(abs(row_names_num - target))
+}
+
+# --- Main: percentile lag plot on RR scale to match heatmap ----------------
+
+plot_lag_effect_for_percentile_rr <- function(
+  cpred, percentile, temp_data_matrix, temp_median,
+  xlab = "Days Relative to Conception (0 = 30 Days Before)",
+  ylab = "Relative Risk (vs median temperature)",
+  highlight_signif = TRUE,  # mark lags where CI excludes 1
+  point_cex = 0.7
+) {
+  rr <- .get_rr(cpred)
+
+  # Temperature for the requested percentile (from your data)
+  target_temp <- as.numeric(quantile(as.vector(temp_data_matrix), percentile/100, na.rm = TRUE))
+
+  # Find the closest available prediction row in cpred (rows are temps)
+  temps_in_cpred <- as.numeric(rownames(rr$fit))
+  if (anyNA(temps_in_cpred)) stop("Row names of cpred RR matrices must be numeric temperatures.")
+  idx <- .closest_row(temps_in_cpred, target_temp)
+  picked_temp <- temps_in_cpred[idx]
+
+  # Extract RR and CI across lags for that temperature
+  rr_fit  <- as.numeric(rr$fit [idx, ])
+  rr_low  <- as.numeric(rr$low [idx, ])
+  rr_high <- as.numeric(rr$high[idx, ])
+
+  # Lag axis from column names like "lag0", "lag1", ...
+  lag_vals <- as.numeric(sub("lag", "", colnames(rr$fit)))
+
+  # y-limits from finite values
+  yy_min <- min(rr_low [is.finite(rr_low )], na.rm = TRUE)
+  yy_max <- max(rr_high[is.finite(rr_high)], na.rm = TRUE)
+
+  # Plot RR curve + CI ribbon
+  plot(lag_vals, rr_fit, type = "l", lwd = 2,
+       ylim = c(yy_min, yy_max),
+       xlab = xlab, ylab = ylab,
+       main = paste0("Effect of ", round(picked_temp, 1), "°C (", percentile,
+                     "th percentile) vs median (", round(temp_median, 1), "°C)"))
+  polygon(c(lag_vals, rev(lag_vals)),
+          c(rr_high,  rev(rr_low)),
+          col = rgb(0, 0, 0, 0.2), border = NA)
+
+  # Baseline for RR
+  abline(h = 1, lty = 2)
+
+  # highlight lags where CI excludes 1 (statistically significant)
+  if (isTRUE(highlight_signif)) {
+    sig_hi <- which(rr_low  > 1 & is.finite(rr_low))
+    sig_lo <- which(rr_high < 1 & is.finite(rr_high))
+    if (length(sig_hi)) points(lag_vals[sig_hi], rr_fit[sig_hi], pch = 16, cex = point_cex)
+    if (length(sig_lo)) points(lag_vals[sig_lo], rr_fit[sig_lo], pch = 16, cex = point_cex)
+    legend("topright", inset = 0.01, bty = "n",
+           legend = c("CI excludes 1"), pch = 16, cex = 0.8)
+  }
+
+  invisible(data.frame(
+    lag = lag_vals,
+    RR = rr_fit,
+    ci_low = rr_low,
+    ci_high = rr_high,
+    temp_value = picked_temp,
+    percentile = percentile
+  ))
+}
+
+# Plot for 1st, 25th, 75th, and 99th percentiles
+plot_lag_effect_for_percentile_rr(cpred,  1, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile_rr(cpred, 25, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile_rr(cpred, 75, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile_rr(cpred, 99, temp_data_matrix, temp_median)
+```
+
+
+
+
+### Min t2mC
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+## Create Daily Lag Frame:
+max_gestation_days <- 210
+pre_conception_days <- 30
+
+crisis_dlnm_eligible <- crisis_simple %>% 
+  filter(gestage_at_survey >= max_gestation_days) %>% # ~37 weeks
+  filter(!is.na(bmi))
+
+
+# Function to process temperature data for the selected metric
+process_temperature_data <- function(era5_data, metric) {
+  era5_data %>%
+    select(community, date, !!sym(metric)) %>%
+    rename(temp_metric = !!sym(metric)) %>%
+    distinct()
+}
+
+# Process temp data
+temp_data_clean <- process_temperature_data(era5_data = era5, metric = "min_t2mC")
+
+
+
+# Generate lags relative to conception
+create_conception_aligned_lags <- function(df, temp_df) {
+  df %>%
+    select(mstudyid, vname, date_conception) %>%
+    rowwise() %>%
+    mutate(day_relative = list(-pre_conception_days:max_gestation_days),
+           date = list(date_conception + day_relative)) %>%
+    unnest(c(day_relative, date)) %>%
+    left_join(temp_df, by = c("vname" = "community", "date" = "date"))  # join temp
+}
+
+
+temp_lags_long <- create_conception_aligned_lags(crisis_dlnm_eligible, temp_data_clean)
+
+# Step 4: Pivot to wide format (like DLNM expects)
+temperature_lags_wide <- temp_lags_long %>%
+  select(mstudyid, date_conception, day_relative, temp_metric) %>%
+  pivot_wider(
+    names_from = day_relative,
+    values_from = temp_metric,
+    names_prefix = "day_"
+  ) %>%
+  left_join(crisis_dlnm_eligible %>% select(mstudyid, sum_nds_category, neg_fin_groups, neg_rel_groups, neg_home_groups, age, bmi, wealthindex, season_delivery, pregchn, married_bin, medlev_bin), by = "mstudyid") %>%
+  filter(!is.na(day_0))
+
+temp_data_matrix <- temperature_lags_wide %>%
+  select(starts_with("day_")) %>%
+  as.matrix()
+
+
+
+# set up DLNM model parameters, fit model, and get predictions
+
+## SET UP PARAMS
+
+# predictor DLNM model parameters -- captures the relationship between the predictor variable (temp) and the outcome
+var_arg = list(fun = "ns", df = 4) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# lag DLNM model parameters -- captures the lagged effects of the predictor variable (temp) over time.
+lag_arg = list(fun = "ns", df = 3) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# cross-basis matrix for DLNM
+cb = crossbasis(temp_data_matrix, lag = c(0, ncol(temp_data_matrix) - 1), argvar = var_arg, arglag = lag_arg) # basis for the predictor and lag 
+
+# ordered logistic regression model
+model_polr <- polr(
+  formula = sum_nds_category ~ cb + age + bmi + wealthindex + season_delivery + pregchn + married_bin + medlev_bin,
+  data = temperature_lags_wide,
+  method = "logistic" 
+)
+
+
+
+# GET PREDICTIONS (in reference to median temp)
+temp_median <- round(median(as.vector(temp_data_matrix)), 1) # centering value (median). 
+crysis_temp_median <- temp_median
+
+
+## check temp dist quickly 
+temp_vec <- as.vector(temp_data_matrix)
+summary(temp_vec)
+quantile(temp_vec, probs = c(0.01, 0.05, 0.1, 0.25, 0.5))
+mean(temp_vec < 17, na.rm = TRUE) * 100   # % of observations below 17 °C
+
+ggplot(data.frame(temp_vec), aes(x = temp_vec)) +
+  geom_histogram(binwidth = 0.5, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = 17, linetype = "dashed", color = "red") +
+  labs(x = "Min Temperature (°C)", y = "Frequency",
+       title = "Distribution of Minimum Temperature Values") +
+  theme_minimal()
+
+
+# generate predictions for a DLNM, set centering value as the median of all temperatures
+cpred = crosspred(cb, 
+                  model_polr, 
+                  ci.level = 0.95, # 95% confidence intervals calculated around predicted values
+                  cen = temp_median, # predictions are relative to this baseline temperature.
+                  by = 0.1) # predictions are generated at intervals of 0.1 units of temperature
+
+
+
+
+png(here("outputs", "figure_S2_contour_min_t2mC.png"), width = 8, height = 6, units = "in", res = 300)
+
+par(mar = c(4.8, 5.6, 2.2, 6.2))  # bottom, left, top, right
+
+plot(cpred, "contour",
+     xlab = "Min temperature (°C)",
+     ylab = "Days relative to conception (0 = 30 days preconception)",
+     key.title = title(main = "Change in \nlog odds", cex.main = 0.8))
+
+dev.off()
+
+
+
+
+# Plot for 1st, 25th, 75th, and 99th percentiles
+plot_lag_effect_for_percentile(cpred, 1, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 25, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 75, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 99, temp_data_matrix, temp_median)
+```
+
+
+## MIN t2mC FIGURE FOR PAPER
+
+```{r}
+
+## ---------- Build the four Min (adjusted for Δ) panels ----------
+A <- make_slice_panel_or(slice_df(cpred, 1, temp_data_matrix, temp_median), "A") + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+B <- make_slice_panel_or(slice_df(cpred, 25, temp_data_matrix, temp_median), "B")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+C <- make_slice_panel_or(slice_df(cpred, 75, temp_data_matrix, temp_median), "C")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+D <- make_slice_panel_or(slice_df(cpred, 99, temp_data_matrix, temp_median), "D")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+p_max <- (A + B) / (C + D) +
+  plot_layout(guides = "collect", heights = c(1, 1)) &
+  theme(plot.margin = margin(t = 5, r = 5, b = 10, l = 10))  # ← increase b (bottom)
+
+# Save to high-resolution PNG
+#png(here("outputs", "Figure2_Mint2mC.png"), width = 9, height = 6, units = "in", res = 600)
+
+pdf(here("outputs", "Figure_S12.pdf"),
+    width = 8, height = 6)
+
+
+# Draw your combined figure
+print(p_max)
+
+# Add shared x/y labels
+grid::grid.text("Days relative to conception (0 = conception)",
+                y = unit(0.015, "npc"), gp = grid::gpar(fontsize = 12))
+grid::grid.text("Odds ratio (higher stress category)",
+                rot = 90, x = unit(0.015, "npc"),
+                gp = grid::gpar(fontsize = 12.5))
+
+# Close the graphics device — this actually writes the file
+dev.off()
+```
+
+
+```{r}
+## pull out specific day windows where there is significance to mention in paper
+slice_75 <- slice_df(cpred, 75, temp_data_matrix, temp_median)
+
+sig_75 <- slice_75 %>%
+  filter(OR_low > 1 | OR_high < 1)
+
+sig_75
+
+
+
+
+slice_99 <- slice_df(cpred, 99, temp_data_matrix, temp_median)
+
+sig_99 <- slice_99 %>%
+  filter(OR_low > 1 | OR_high < 1)
+
+sig_99
+```
+
+### t2mC Delta (max-min temp) to examine effect of cooling
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+## Create Daily Lag Frame:
+max_gestation_days <- 210
+pre_conception_days <- 30
+
+crisis_dlnm_eligible <- crisis_simple %>% 
+  filter(gestage_at_survey >= max_gestation_days) %>% # ~37 weeks
+  filter(!is.na(bmi))
+
+
+# Function to process temperature data for the selected metric
+process_temperature_data <- function(era5_data, metric) {
+  era5_data %>%
+    select(community, date, !!sym(metric)) %>%
+    rename(temp_metric = !!sym(metric)) %>%
+    distinct()
+}
+
+# Process temp data
+temp_data_clean <- process_temperature_data(era5_data = era5, metric = "t2mC_delta")
+
+
+
+# Generate lags relative to conception
+create_conception_aligned_lags <- function(df, temp_df) {
+  df %>%
+    select(mstudyid, vname, date_conception) %>%
+    rowwise() %>%
+    mutate(day_relative = list(-pre_conception_days:max_gestation_days),
+           date = list(date_conception + day_relative)) %>%
+    unnest(c(day_relative, date)) %>%
+    left_join(temp_df, by = c("vname" = "community", "date" = "date"))  # join temp
+}
+
+
+temp_lags_long <- create_conception_aligned_lags(crisis_dlnm_eligible, temp_data_clean)
+
+# Step 4: Pivot to wide format (like DLNM expects)
+temperature_lags_wide <- temp_lags_long %>%
+  select(mstudyid, date_conception, day_relative, temp_metric) %>%
+  pivot_wider(
+    names_from = day_relative,
+    values_from = temp_metric,
+    names_prefix = "day_"
+  ) %>%
+  left_join(crisis_dlnm_eligible %>% select(mstudyid, sum_nds_category, neg_fin_groups, neg_rel_groups, neg_home_groups, age, bmi, wealthindex, pregchn, season_delivery, married_bin, medlev_bin), by = "mstudyid") %>%
+  filter(!is.na(day_0))
+
+temp_data_matrix <- temperature_lags_wide %>%
+  select(starts_with("day_")) %>%
+  as.matrix()
+
+```
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# set up DLNM model parameters, fit model, and get predictions
+
+## SET UP PARAMS
+
+# predictor DLNM model parameters -- captures the relationship between the predictor variable (temp) and the outcome
+var_arg = list(fun = "ns", df = 4) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# lag DLNM model parameters -- captures the lagged effects of the predictor variable (temp) over time.
+lag_arg = list(fun = "ns", df = 3) # smooth cubic polynomial (degree = 3) between the boundary knots (no internal knots)
+
+# cross-basis matrix for DLNM
+cb = crossbasis(temp_data_matrix, lag = c(0, ncol(temp_data_matrix) - 1), argvar = var_arg, arglag = lag_arg) # basis for the predictor and lag 
+
+# ordered logistic regression model
+model_polr <- polr(
+  formula = sum_nds_category ~ cb + age + bmi + wealthindex + season_delivery + pregchn + married_bin + medlev_bin,
+  data = temperature_lags_wide,
+  method = "logistic" 
+)
+
+
+# GET PREDICTIONS (in reference to median temp)
+temp_median <- round(median(as.vector(temp_data_matrix)), 1) # centering value (median). 
+crysis_temp_median <- temp_median
+
+# generate predictions for a DLNM, set centering value as the median of all temperatures
+cpred = crosspred(cb, 
+                  model_polr, 
+                  ci.level = 0.95, # 95% confidence intervals calculated around predicted values
+                  cen = temp_median, # predictions are relative to this baseline temperature.
+                  by = 0.1) # predictions are generated at intervals of 0.1 units of temperature
+
+
+# plot contour map of 3d plot
+plot(
+  cpred, 
+  "contour", 
+  main = paste0("Effects of Temperature Delta and Lag on Log Odds \nof Higher Stress Category Relative \nto Median Delta Temperature (",temp_median, "°C)"), 
+  xlab = "Temperature Delta (°C)", 
+  ylab = "Days Relative to Conception (0 = 30 Days Before)", 
+  key.title = title(main = "Change in \nLog Odds", cex.main = 0.8)
+)
+```
+
+
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+plot_lag_effect_for_percentile <- function(cpred, percentile, temp_data_matrix, temp_median,
+                                           xlab = "Days Relative to Conception (0 = 30 Days Before)",
+                                           ylab = "Change in Log Odds of Higher Stress Category") {
+  
+  # Get temperature at desired percentile
+  temp_value <- round(quantile(as.vector(temp_data_matrix), percentile / 100), 1)
+  
+  # Extract effect estimates and CI for that temperature
+  matfit <- cpred$matfit[rownames(cpred$matfit) == temp_value, ]
+  matlow <- cpred$matlow[rownames(cpred$matlow) == temp_value, ]
+  mathigh <- cpred$mathigh[rownames(cpred$mathigh) == temp_value, ]
+  
+  # Clean lag names
+  names(matfit) <- names(matlow) <- names(mathigh) <- sub("lag", "", names(matfit))
+  
+  # Create plot
+  plot(
+    x = as.numeric(names(matfit)),
+    y = matfit,
+    type = "l",
+    lwd = 2,
+    ylim = c(min(matlow), max(mathigh)),
+    xlab = xlab,
+    ylab = ylab,
+    main = paste0("Effect of ", temp_value, "\u00B0C (", percentile, "th Percentile) \nvs Median (", temp_median, "\u00B0C)")
+  )
+  
+  # Add shaded confidence interval
+  polygon(
+    x = c(as.numeric(names(mathigh)), rev(as.numeric(names(matlow)))),
+    y = c(mathigh, rev(matlow)),
+    col = rgb(0, 0, 0, alpha = 0.2),
+    border = NA
+  )
+  
+  abline(h = 0, lty = 2)
+  
+  # Return data frame if needed
+  return(invisible(data.frame(
+    lag = as.numeric(names(matfit)),
+    effect = matfit,
+    ci_low = matlow,
+    ci_high = mathigh,
+    temp_value = temp_value,
+    percentile = percentile
+  )))
+}
+
+
+# Plot for 1st, 25th, 75th, and 99th percentiles
+plot_lag_effect_for_percentile(cpred, 1, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 25, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 75, temp_data_matrix, temp_median)
+plot_lag_effect_for_percentile(cpred, 99, temp_data_matrix, temp_median)
+```
+
+
+
+
+
+
+### t2mC MAX + DELTA INTERACTION
+
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+## --- Setup shared calendar & pull both metrics ---
+max_gestation_days <- 210
+pre_conception_days <- 30
+
+crisis_dlnm_eligible <- crisis_simple %>% 
+  filter(gestage_at_survey >= max_gestation_days) %>% # ~37 weeks
+  filter(!is.na(bmi))
+
+
+# a) conception-aligned calendar (one row per subject-day)
+make_calendar <- function(df) {
+  df %>%
+    select(mstudyid, vname, date_conception) %>%
+    rowwise() %>%
+    mutate(day_relative = list(-pre_conception_days:max_gestation_days),
+           date = list(date_conception + day_relative)) %>%
+    unnest(c(day_relative, date))
+}
+
+cal_long <- make_calendar(crisis_dlnm_eligible)
+
+# b) join BOTH exposures to the same long frame
+expos_long <- cal_long %>%
+  left_join(
+    era5 %>%
+      select(community, date, max_t2mC, min_t2mC, t2mC_delta),
+    by = c("vname" = "community", "date" = "date")
+  )
+
+## --- Pivot to wide twice: one matrix for max, one for delta ---
+wide_max <- expos_long %>%
+  select(mstudyid, date_conception, day_relative, max_t2mC) %>%
+  pivot_wider(names_from = day_relative, values_from = max_t2mC, names_prefix = "max_")
+
+wide_delta <- expos_long %>%
+  select(mstudyid, date_conception, day_relative, t2mC_delta) %>%
+  pivot_wider(names_from = day_relative, values_from = t2mC_delta, names_prefix = "delta_")
+
+# c) align rows and add covariates
+design <- crisis_dlnm_eligible %>%
+  select(mstudyid, sum_nds_category, age, bmi, wealthindex, pregchn, season_delivery, married_bin, medlev_bin) %>%
+  left_join(wide_max,   by = c("mstudyid")) %>%
+  left_join(wide_delta, by = c("mstudyid")) %>%
+  # require exposure present at "day_0" for BOTH metrics
+  filter(!is.na(max_0), !is.na(delta_0))
+
+# d) build matrices
+mat_max   <- design %>% select(starts_with("max_"))   %>% as.matrix()
+mat_delta <- design %>% select(starts_with("delta_")) %>% as.matrix()
+
+## --- Cross-bases and model (joint main effects) ---
+library(dlnm)
+var_arg <- list(fun = "ns", df = 4)
+lag_arg <- list(fun = "ns", df = 3)
+
+cb_max   <- crossbasis(mat_max,   lag = c(0, ncol(mat_max)   - 1), argvar = var_arg, arglag = lag_arg)
+cb_delta <- crossbasis(mat_delta, lag = c(0, ncol(mat_delta) - 1), argvar = var_arg, arglag = lag_arg)
+
+# Fit ordered logistic with BOTH cross-bases
+model_joint <- MASS::polr(
+  sum_nds_category ~ cb_max + cb_delta + age + bmi + wealthindex + season_delivery + pregchn + married_bin + medlev_bin,
+  data = design,
+  method = "logistic"
+)
+
+## --- Predictions: adjusted surfaces ---
+cen_max   <- round(median(as.vector(mat_max),   na.rm = TRUE), 1)
+cen_delta <- round(median(as.vector(mat_delta), na.rm = TRUE), 1)
+
+pred_max_adj   <- crosspred(cb_max,   model_joint, cen = cen_max,   by = 0.1)
+pred_delta_adj <- crosspred(cb_delta, model_joint, cen = cen_delta, by = 0.1)
+
+# Example plot (max t2mC adjusted for delta)
+plot(pred_max_adj, "contour",
+     main = paste0("Max t2mC × Lag (adj for Δ), centered at ", cen_max, "°C"),
+     xlab = "Max t2mC (°C)",
+     ylab = "Days Relative to Conception (0 = 30 Days Before)",
+     key.title = title(main = "Δ Log-Odds", cex.main = 0.8))
+
+# Example plot (delta adjusted for max)
+plot(pred_delta_adj, "contour",
+     main = paste0("Overnight Cooling (Δ) × Lag (adj for Max), centered at ", cen_delta, "°C"),
+     xlab = "t2mC Δ (°C)",
+     ylab = "Days Relative to Conception (0 = 30 Days Before)",
+     key.title = title(main = "Δ Log-Odds", cex.main = 0.8))
+
+```
+
+
+
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+slice_plot <- function(cpred,
+                       exposure_matrix,
+                       center_val,
+                       percentile = NULL,   # e.g., 1, 25, 75, 99
+                       at_val     = NULL,   # or a fixed value like 31.0
+                       adj_for    = "Δ",    # label: what this is adjusted for
+                       exposure_label = "", # optional label to prepend in title
+                       xlab = "Days Relative to Conception (0 = 30 Days Before)",
+                       ylab = "Δ Log-Odds (higher stress category)",
+                       main = NULL) {
+
+  if (is.null(at_val)) {
+    stopifnot(!is.null(percentile))
+    at_val <- as.numeric(quantile(as.vector(exposure_matrix),
+                                  probs = percentile/100, na.rm = TRUE))
+  }
+
+  # find nearest grid value on cpred
+  row_vals <- as.numeric(rownames(cpred$matfit))
+  idx <- which.min(abs(row_vals - at_val))
+  used_val <- row_vals[idx]
+
+  matfit  <- cpred$matfit[idx, ]
+  matlow  <- cpred$matlow[idx, ]
+  mathigh <- cpred$mathigh[idx, ]
+
+  # lag axis
+  lag_names <- names(matfit)
+  lags <- if (all(grepl("^lag", lag_names))) as.numeric(sub("^lag", "", lag_names)) else seq_along(matfit) - 1
+
+  # auto title if none supplied
+  if (is.null(main)) {
+    ptxt <- if (!is.null(percentile)) paste0(" (", percentile, "th percentile)") else ""
+    prefix <- if (nzchar(exposure_label)) paste0(exposure_label, " ") else ""
+    main <- sprintf("Effect at %s%.1f°C%s compared to median (%.1f°C), adj for %s",
+                    prefix, used_val, ptxt, center_val, adj_for)
+  }
+
+  # plot
+  plot(lags, matfit, type = "l", lwd = 2,
+       ylim = range(c(matlow, mathigh), na.rm = TRUE),
+       xlab = xlab, ylab = ylab, main = main)
+  polygon(c(lags, rev(lags)), c(mathigh, rev(matlow)),
+          col = rgb(0, 0, 0, 0.2), border = NA)
+  abline(h = 0, lty = 2)
+
+  invisible(tibble(lag = lags, effect = matfit, ci_low = matlow, ci_high = mathigh,
+                   requested_val = at_val, used_val = used_val, center_val = center_val))
+}
+
+
+
+## ---------- CALLS FOR YOUR TWO ADJUSTED SURFACES ----------
+## MAX t2mC slices (adjusted for Δ)
+slice_plot(pred_max_adj, mat_max, center_val = cen_max,
+           percentile = 1,  adj_for = "Δ",        exposure_label = "Max t2mC")
+slice_plot(pred_max_adj, mat_max, center_val = cen_max,
+           percentile = 25, adj_for = "Δ",        exposure_label = "Max t2mC")
+slice_plot(pred_max_adj, mat_max, center_val = cen_max,
+           percentile = 75, adj_for = "Δ",        exposure_label = "Max t2mC")
+slice_plot(pred_max_adj, mat_max, center_val = cen_max,
+           percentile = 99, adj_for = "Δ",        exposure_label = "Max t2mC")
+
+## Δ (overnight cooling) slices (adjusted for max t2mC)
+slice_plot(pred_delta_adj, mat_delta, center_val = cen_delta,
+           percentile = 1,  adj_for = "max t2mC", exposure_label = "Δt2mC")
+slice_plot(pred_delta_adj, mat_delta, center_val = cen_delta,
+           percentile = 25, adj_for = "max t2mC", exposure_label = "Δt2mC")
+slice_plot(pred_delta_adj, mat_delta, center_val = cen_delta,
+           percentile = 75, adj_for = "max t2mC", exposure_label = "Δt2mC")
+slice_plot(pred_delta_adj, mat_delta, center_val = cen_delta,
+           percentile = 99, adj_for = "max t2mC", exposure_label = "Δt2mC")
+
+```
+
+
+
+
+```{r}
+
+## ---------- Build the four MAX (adjusted for Δ) panels ----------
+A <- make_slice_panel_or(slice_df(pred_max_adj, 1, mat_max, cen_max), "A") + 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+B <- make_slice_panel_or(slice_df(pred_max_adj, 25, mat_max, cen_max), "B")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+C <- make_slice_panel_or(slice_df(pred_max_adj, 75, mat_max, cen_max), "C")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+D <- make_slice_panel_or(slice_df(pred_max_adj, 99, mat_max, cen_max), "D")+ 
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+p_max <- (A + B) / (C + D) +
+  plot_layout(guides = "collect", heights = c(1, 1)) &
+  theme(plot.margin = margin(t = 5, r = 5, b = 10, l = 10))  # ← increase b (bottom)
+
+# Save to high-resolution PNG
+png(here("outputs", "FigureS7_adjusted_Maxt2mC.png"), width = 9, height = 6, units = "in", res = 600)
+
+# Draw your combined figure
+print(p_max)
+
+# Add shared x/y labels
+grid::grid.text("Days Relative to Conception (0 = 30 Days Before)",
+                y = unit(0.015, "npc"), gp = grid::gpar(fontsize = 12))
+grid::grid.text("Δ Log-Odds (higher stress category)",
+                rot = 90, x = unit(0.01, "npc"), gp = grid::gpar(fontsize = 12))
+
+# Close the graphics device — this actually writes the file
+dev.off()
+```
+
+
+
+
+
+
+
+### Trimester-level ordered logistic regressions
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+### Make sure to use crysis term data
+crisis_dlnm_eligible <- crisis_dlnm_eligible %>%
+  mutate(sum_nds_category = ordered(sum_nds_category, levels = c("low","moderate","high")))
+
+
+calc_custom_temp_avg <- function(stress_data, temp_data, metric) {
+  stress_data %>%
+    rowwise() %>%
+    mutate(
+      # Temperature on the day of the survey
+      avg_temp_day_of_survey = temp_data %>%
+        filter(community == vname, date == survey_date) %>%
+        summarise(mean_temp = mean(!!sym(metric), na.rm = TRUE)) %>%
+        pull(mean_temp),
+      
+      # Temperature the day before the survey
+      avg_temp_day_before_survey = temp_data %>%
+        filter(community == vname, date == survey_date - 1) %>%
+        summarise(mean_temp = mean(!!sym(metric), na.rm = TRUE)) %>%
+        pull(mean_temp),
+      
+      # Average temperature for the week before the survey
+      avg_temp_week_before_survey = temp_data %>%
+        filter(community == vname, date >= survey_date - 7 & date < survey_date) %>%
+        summarise(mean_temp = mean(!!sym(metric), na.rm = TRUE)) %>%
+        pull(mean_temp),
+      
+       # Average temperature for the month before the survey
+      avg_temp_month_before_survey = temp_data %>%
+        filter(community == vname, date >= survey_date - 30 & date < survey_date) %>%
+        summarise(mean_temp = mean(!!sym(metric), na.rm = TRUE)) %>%
+        pull(mean_temp),
+      
+      # Average temperature for the 3 months before the survey
+      avg_temp_3_months_before = temp_data %>%
+        filter(community == vname, date >= survey_date - 90 & date < survey_date) %>%
+        summarise(mean_temp = mean(!!sym(metric), na.rm = TRUE)) %>%
+        pull(mean_temp),
+      
+      # Average temperature for the 6 months before the survey
+      avg_temp_6_months_before = temp_data %>%
+        filter(community == vname, date >= survey_date - 180 & date < survey_date) %>%
+        summarise(mean_temp = mean(!!sym(metric), na.rm = TRUE)) %>%
+        pull(mean_temp),
+      
+      ## TRIMESTER TEMP CALCULATIONS
+      
+      # Pre-conception temperature average (30 days before conception)
+      avg_temp_pre_conception = temp_data %>%
+        filter(
+          community == vname,
+          date >= date_conception - 30 & date < date_conception
+        ) %>%
+        summarise(mean_temp = mean(!!sym(metric), na.rm = TRUE)) %>%
+        pull(mean_temp),
+      
+      # First trimester temperature average
+      avg_temp_first_trimester = temp_data %>%
+        filter(
+          community == vname,
+          date >= date_conception & date < date_conception + 98
+        ) %>%
+        summarise(mean_temp = mean(!!sym(metric), na.rm = TRUE)) %>%
+        pull(mean_temp),
+      
+      # Second trimester temperature average (require ≥30 days of data)
+      avg_temp_second_trimester = {
+        x <- temp_data %>%
+          filter(community == vname,
+                 date >= date_conception + 98,
+                 date < date_conception + 196)
+        if (nrow(x) >= 30) mean(x[[metric]], na.rm = TRUE) else NA_real_
+      },
+      
+      # Third trimester temperature average
+      avg_temp_third_trimester = if (survey_date < datdeliv) {
+        # surveyed before delivery → exposures up to survey
+        x <- temp_data %>%
+          filter(community == vname,
+                 date >= date_conception + 196,
+                 date <= survey_date)
+        if (nrow(x) >= 30) mean(x[[metric]], na.rm = TRUE) else NA_real_
+      } else {
+        # surveyed after delivery → full trimester up to delivery
+        x <- temp_data %>%
+          filter(community == vname,
+                 date >= date_conception + 196,
+                 date <= datdeliv)
+        if (nrow(x) >= 30) mean(x[[metric]], na.rm = TRUE) else NA_real_
+      }, 
+      # Average temperature across the entire pregnancy
+      avg_temp_entire_pregnancy = temp_data %>%
+        filter(
+          community == vname,
+          date >= date_conception & date <= survey_date
+        ) %>%
+        summarise(mean_temp = mean(!!sym(metric), na.rm = TRUE)) %>%
+        pull(mean_temp)
+    ) %>%
+    ungroup()
+}
+
+
+
+metric <- "max_t2mC"
+
+stress_data_with_temp <- calc_custom_temp_avg(crisis_dlnm_eligible, era5, metric)
+
+vars <- c(
+  "avg_temp_pre_conception",
+  "avg_temp_first_trimester",
+  "avg_temp_second_trimester",
+  "avg_temp_third_trimester",
+  "avg_temp_entire_pregnancy"
+)
+
+stress_data_with_temp %>%
+  select(all_of(vars)) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~name, scales = "free_x")
+
+
+
+
+##  Fit ordered logits (unadjusted now; add covars later)
+models <- list(
+  "Pre-Conception"    = polr(sum_nds_category ~ avg_temp_pre_conception + age + bmi + wealthindex + pregchn + season_delivery + married_bin + medlev_bin, data = stress_data_with_temp, method = "logistic", na.action = na.omit),
+  
+  "First Trimester"   = polr(sum_nds_category ~ avg_temp_first_trimester + age + bmi + wealthindex + pregchn + season_delivery + married_bin + medlev_bin, data = stress_data_with_temp, method = "logistic", na.action = na.omit),
+  
+  "Second Trimester"  = polr(sum_nds_category ~ avg_temp_second_trimester + age + bmi + wealthindex + pregchn + season_delivery + married_bin + medlev_bin,  data = stress_data_with_temp, method = "logistic", na.action = na.omit),
+  
+  "Third Trimester"   = polr(sum_nds_category ~ avg_temp_third_trimester + age + bmi + wealthindex + pregchn + season_delivery + married_bin + medlev_bin, data = stress_data_with_temp, method = "logistic", na.action = na.omit),
+  
+  "Entire Pregnancy"  = polr(sum_nds_category ~ avg_temp_entire_pregnancy + age + bmi + wealthindex + pregchn + season_delivery + married_bin + medlev_bin, data = stress_data_with_temp, method = "logistic", na.action = na.omit)
+)
+
+
+## 4) Helper to tidy polr and drop cut-points
+tidy_polr <- function(fit) {
+  td <- broom::tidy(fit) %>%
+    filter(!str_detect(term, "\\|")) %>%       # drop thresholds
+    mutate(p.value = 2*pnorm(abs(statistic), lower.tail = FALSE))
+  td
+}
+
+## 5) Build MAIN table (exposure effect only, plus CI, P, N)
+window_map <- tibble::tibble(
+  Model = names(models),
+  term  = c("avg_temp_pre_conception","avg_temp_first_trimester",
+            "avg_temp_second_trimester","avg_temp_third_trimester",
+            "avg_temp_entire_pregnancy")
+)
+
+main_tbl <- purrr::map2_dfr(models, window_map$term, ~{
+  td <- tidy_polr(.x) %>% filter(term == .y)
+  td %>%
+  transmute(
+    Model = window_map$Model[which(window_map$term == .y)],
+    OR = exp(estimate),
+    lo = exp(estimate - 1.96*std.error),
+    hi = exp(estimate + 1.96*std.error),
+    `OR (95% CI)` = sprintf("%.2f (%.2f, %.2f)", OR, lo, hi),
+    `P-value` = p.value,
+    N = nrow(model.frame(.x))
+  )
+})
+
+main_table_save <- main_tbl %>%
+  select(Model, `OR (95% CI)`, `P-value`, N) %>%
+  gt() %>%
+  fmt_number(columns = c(`P-value`), decimals = 3) %>%
+  cols_align("center")
+
+## 6) Build SUPPLEMENTAL table (full coefficients, per window)
+
+format_p <- function(p) {
+  ifelse(p < 0.001, "<0.001",
+         ifelse(p < 0.01,
+                sprintf("%.3f", p),
+                sprintf("%.2f", p)))
+}
+
+# Build SUPPLEMENTAL table: OR + CI + p-value
+supp_tbl_clean <- purrr::imap_dfr(models, function(m, nm) {
+  tidy_polr(m) %>%
+    mutate(
+      Model = nm,
+      OR  = exp(estimate),
+      lo  = exp(estimate - 1.96 * std.error),
+      hi  = exp(estimate + 1.96 * std.error),
+      OR_CI = sprintf("%.2f (%.2f, %.2f)", OR, lo, hi),
+      p_formatted = format_p(p.value)
+    ) %>%
+    select(Model, term, OR_CI, p_formatted)
+})
+
+# Convert to gt table
+supp_table_save <- supp_tbl_clean %>%
+  rename(
+    Predictor = term,
+    `OR (95% CI)` = OR_CI,
+    `P-value` = p_formatted
+  ) %>%
+  gt(groupname_col = "Model") %>%
+  cols_align("center") %>%
+  tab_options(
+    table.font.size = px(12),
+    data_row.padding = px(4),
+    heading.align = "left"
+  )
+
+
+# supp_tbl <- purrr::imap_dfr(models, function(m, nm) {
+#   tidy_polr(m) %>%
+#     mutate(
+#       Model = nm,
+#       OddsRatio = exp(estimate)
+#     ) %>%
+#     select(Model, term, estimate, std.error, OddsRatio, p.value)
+# })
+# 
+# supp_table_save <- supp_tbl %>%
+#   rename(
+#     Predictor = term,
+#     Coefficient = estimate,
+#     `Std. Error` = std.error,
+#     `Odds Ratio` = OddsRatio,
+#     `P-value` = p.value
+#   ) %>%
+#   gt(groupname_col = "Model") %>%
+#   fmt_number(columns = c(Coefficient, `Std. Error`, `Odds Ratio`, `P-value`), decimals = 3) %>%
+#   cols_align("center")
+
+
+
+gtsave(
+  data = supp_table_save,
+  filename = here("outputs", "t2mC_Supplemental_Regression_Table.rtf")
+  )
+
+gtsave(main_table_save, here("outputs", "t2mC_regression_table_main.png"), vwidth = 2000, vheight = 900, expand = 5)
+gtsave(supp_table_save, here("outputs", "t2mC_regression_table_supplement.png"), vwidth = 2000, vheight = 1600, expand = 5)
+
+gtsave(main_table_save,here("outputs", "t2mC_regression_table_main.pdf"))
+gtsave(supp_table_save,here("outputs", "t2mC_regression_table_supplement.pdf"))
+```
+
+
+```{r}
+model_all_trimesters_together <- polr(sum_nds_category ~ 
+        avg_temp_pre_conception +
+        avg_temp_first_trimester +
+        avg_temp_second_trimester +
+        avg_temp_third_trimester +
+        age + bmi + wealthindex + pregchn + season_delivery + married_bin + medlev_bin,
+     data = stress_data_with_temp,
+     method = "logistic",
+     na.action = na.omit)
+
+
+# use same tidy_polr helper function created abovve
+
+temp_terms <- c(
+  "avg_temp_pre_conception",
+  "avg_temp_first_trimester",
+  "avg_temp_second_trimester",
+  "avg_temp_third_trimester"
+)
+
+model_all_trimesters_together_tbl <- tidy_polr(model_all_trimesters_together) %>%
+  mutate(
+    OR = exp(estimate),
+    lo = exp(estimate - 1.96 * std.error),
+    hi = exp(estimate + 1.96 * std.error),
+    `OR (95% CI)` = sprintf("%.2f (%.2f, %.2f)", OR, lo, hi),
+    N = nrow(model.frame(model_all_trimesters_together))
+  ) %>%
+  select(term, OR, lo, hi, `OR (95% CI)`, p.value, N)
+
+
+model_all_trimesters_together_tbl_save <- model_all_trimesters_together_tbl %>%
+  select(-c(OR, lo, hi, N)) %>%
+  rename(
+    Predictor = term,
+    `P-value` = p.value
+  ) %>%
+  gt() %>%
+  fmt_number(
+    columns = `P-value`,
+    decimals = 3
+  ) %>%
+  cols_align("center")
+
+
+
+gtsave(
+  data = model_all_trimesters_together_tbl_save,
+  filename = here("outputs", "t2mC_model_all_trimesters_together_tbl_save.rtf")
+  )
+```
+
+The regression analysis explores the association between wet bulb globe temperature (t2mC) and stress using the Sum NDS Category during different periods of pregnancy. The results indicate that:
+
+-   **Entire Pregnancy**: Higher average daily maximum hi during the entire pregnancy is significantly associated with belonging to a higher stress group, with a one degree increase in hi associated with a 55.7% increase in the odds of belonging to a higher stress group (p = 0.004).
+
+-   **Pre-Conception**: Higher average daily maximum hi during the pre-conception period is significantly associated with belonging to a higher stress group, with a one degree increase in hi associated with a 19.3% increase in the odds of belonging to a higher stress group (p = 0.038).
+
+-   **Trimester-Specific Averages**:  Higher average daily maximum hi during the first trimester is significantly associated with belonging to a higher stress group, with a one degree increase in hi associated with a 35.1% increase in the odds of belonging to a higher stress group (p = 0.002). While the second trimester showed a positive association between temperature and Sum NDS Category, the effect was not significant. The third trimester average showed no effect, indicating that the temperatures nearest to the survey date appear less strongly associated with the Sum NDS Category.  
+
+
+
+
+
+# Distributions of Data
+
+## Distributions of negative events and NDS across domains
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Select only the `events` columns
+events_columns <- crisis_dlnm_eligible %>%
+  select(ends_with("events")) %>%
+  select(-total_events)
+
+events_summary <- colSums(events_columns)
+
+
+# Select only the `neg` columns
+neg_columns <- crisis_dlnm_eligible %>%
+  select(ends_with("neg"))
+
+# Count occurrences of numeric values in each column
+neg_summary <- sapply(neg_columns, function(col) sum(as.numeric(col), na.rm = TRUE)) # warning is because function can't convert "No Event" to numeric. It makes then NAs, which for this purpose works great
+
+# Convert to a data frame for plotting
+neg_summary_df <- data.frame(
+  Domain = names(neg_summary),
+  Count = neg_summary
+)
+
+neg_event_labels <- c(
+  crifinneg = "Financial", 
+  crilegalneg = "Legal", 
+  cricareerneg = "Career", 
+  crirelneg = "Relationship", 
+  crihomesafeneg = "Home safety", 
+  crineighsafeneg = "Neighborhood safety", 
+  crimedselfneg = "Self medical", 
+  crimedothneg = "Other medical", 
+  crihomeneg = "Home", 
+  criprejneg = "Prejudice", 
+  criauthneg = "Authority", 
+  criothneg = "Other"
+)
+
+# Plot with the updated labels
+neg_events_domain_dist <- ggplot(neg_summary_df, aes(x = reorder(Domain, -Count), y = Count)) +
+  geom_bar(stat = "identity") +
+  geom_col(color = "black", fill = "grey40", alpha = 1) +
+  scale_x_discrete(labels = neg_event_labels) +
+  labs(
+    title = "(A) Total number of negatively perceived \nevents reported across domains.",
+    x = "Domain",
+    y = "Number of Events"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+
+# Select only the `nds` columns
+nds_columns <- crisis_dlnm_eligible %>%
+  select(ends_with("nds")) %>%
+  select(-sum_nds)
+
+# Count occurrences of numeric values in each column
+nds_summary <- sapply(nds_columns, function(col) sum(as.numeric(col), na.rm = TRUE)) # warning is because function can't convert "No Event" to numeric. It makes then NAs, which for this purpose works great
+
+# Convert to a data frame for plotting
+nds_summary_df <- data.frame(
+  Domain = names(nds_summary),
+  Count = nds_summary
+)
+
+nds_labels <- c(
+  fin_nds = "Financial", 
+  leg_nds = "Legal", 
+  car_nds = "Career", 
+  rel_nds = "Relationship", 
+  homesf_nds = "Home safety", 
+  neighsf_nds = "Neighborhood safety", 
+  medself_nds = "Self medical", 
+  medoth_nds = "Other medical", 
+  home_nds = "Home", 
+  prej_nds = "Prejudice", 
+  auth_nds = "Authority", 
+  oth_nds = "Other"
+)
+
+sum_nds_domain_dist <- ggplot(nds_summary_df, aes(x = reorder(Domain, -Count), y = Count)) +
+  geom_bar(stat = "identity") +
+  geom_col(color = "black", fill = "grey40", alpha = 1) +
+  scale_x_discrete(labels = nds_labels) +
+  labs(
+    title = "(B) Number of participants who experienced \nat least one negative event in each domain.",
+    x = "Domain",
+    y = "Number of Participants"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+combined_fig <- neg_events_domain_dist + sum_nds_domain_dist +
+  plot_annotation(
+    title = "Figure S2. Distribution of negatively perceived events by domain",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5)
+    )
+  )
+
+
+
+
+
+
+
+
+# helper to make a consistent bar panel
+make_domain_bar <- function(df, labels, ylab, subtitle) {
+  ggplot(df, aes(x = reorder(Domain, -Count), y = Count)) +
+    geom_col(fill = "grey40", color = "black", width = 0.85) +
+    scale_x_discrete(labels = labels) +
+    labs(x = "Domain", y = ylab, subtitle = subtitle) +
+    coord_cartesian(ylim = c(0, max(df$Count, na.rm = TRUE) * 1.08)) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.subtitle = element_text(face = "bold", hjust = 0, margin = margin(b = 5)),
+      axis.text.x   = element_text(angle = 45, hjust = 1),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank()
+    )
+}
+
+# A: total # of events per domain
+pA <- make_domain_bar(
+  df = neg_summary_df,
+  labels = neg_event_labels,
+  ylab = "Number of Events",
+  subtitle = "Total number of negatively perceived \nevents reported across domains"
+)
+
+# B: # of participants with ≥1 event per domain
+pB <- make_domain_bar(
+  df = nds_summary_df,
+  labels = nds_labels,
+  ylab = "Number of Participants",
+  subtitle = "Participants who experienced at least one \nnegative event in each domain"
+)
+
+# combine with A/B tags; no overall title (use manuscript caption instead)
+combined_fig <- (pA + pB) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(face = "bold", size = 12),
+      plot.tag.position = c(0.01, 0.98)  # top-left
+    )
+  )
+
+combined_fig
+
+
+ggsave(here("outputs", "figureS2_neg_event_domains.png"),
+       combined_fig, 
+       width = 9, 
+       height = 5, 
+       dpi = 400)
+
+
+
+```
+
+## Distribution of Sum NDS across participants 
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+
+# Bar for the sum NDS score
+nds_count_data <- crisis_dlnm_eligible %>%
+  count(sum_nds)
+
+
+sample_stats <- crisis_dlnm_eligible %>%
+  summarise(
+    n = n(),
+    median = median(sum_nds, na.rm = TRUE),
+    q1 = quantile(sum_nds, 0.25, na.rm = TRUE),
+    q3 = quantile(sum_nds, 0.75, na.rm = TRUE)
+  ) %>%
+  mutate(
+    stats_label = paste0("N = ", n, "\nMedian = ", round(median, 2), "\nIQR = ", round(q1, 1), "–", round(q3, 1))
+  )
+
+
+## 4) Headroom for labels + a safe place for the stats box
+y_max      <- max(nds_count_data$n, na.rm = TRUE)
+x_min      <- min(nds_count_data$sum_nds, na.rm = TRUE)
+x_max      <- max(nds_count_data$sum_nds, na.rm = TRUE)
+x_statspos <- x_min + 0.75*(x_max - x_min)  # ~right side
+y_statspos <- y_max * 0.70
+
+## 5) Plot (no baked title; panel title will live in the manuscript caption)
+nds_dist_plot <- ggplot(nds_count_data, aes(sum_nds, n)) +
+  geom_col(fill = "grey40", color = "black", width = 0.85) +
+  geom_text(aes(label = n), vjust = -0.4, size = 3) +
+  annotate("label",
+           x = x_statspos, y = y_statspos,
+           label = sample_stats$stats_label,
+           label.size = 0, fill = "white", alpha = 0.9) +
+  scale_x_continuous(breaks = seq(x_min, x_max, by = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +  # top headroom
+  labs(x = "Sum NDS", y = "Participants") +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.margin = margin(10, 15, 10, 10)
+  )
+
+nds_dist_plot
+
+
+
+
+ggsave(
+  here("outputs", "figureS1_nds_dist.png"),
+  nds_dist_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+crisis_recode %>%
+  count(sum_nds_category) %>%
+  ggplot(aes(x = sum_nds_category, y = n))  +
+  geom_col(fill = "steelblue", color = "black") +
+  geom_text(aes(label = n), vjust = -0.5) +
+  theme_minimal() +
+  labs(title = "Distribution of Sum NDS Category", x = "Sum NDS Category", y = "Participants")
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+print("Summary of Sum NDS data")
+summary(crisis_dlnm_eligible$sum_nds)
+```
+
+
+# Participant and exposure characteristics table 
+
+```{r}
+# Packages
+library(tidyverse)
+library(gtsummary)
+library(labelled)
+library(forcats)
+library(janitor)
+library(knitr)
+library(kableExtra)
+library(gt)
+
+# Temperature: compute rowwise Min/Max t2mC across all lag columns
+
+# Number of pre- and post-conception days
+max_gestation_days <- 210
+pre_conception_days <- 30
+
+# ---- helper that also tracks completeness and drops sparse rows ----
+compute_participant_mean <- function(era5_data, metric, max_gestation_days = 210, pre_conception_days = 30,
+                                     min_prop_days = 0.8) { # min prop days is not necessary for our data, which is 100% complete 
+  temp_df <- era5_data %>%
+    select(community, date, !!sym(metric)) %>%
+    rename(temp_metric = !!sym(metric)) %>%
+    distinct()
+
+  total_days <- pre_conception_days + max_gestation_days + 1  # inclusive of day_0
+
+  lags_long <- crisis_dlnm_eligible %>%
+    select(mstudyid, vname, date_conception) %>%
+    rowwise() %>%
+    mutate(day_relative = list(-pre_conception_days:max_gestation_days),
+           date = list(date_conception + day_relative)) %>%
+    unnest(c(day_relative, date)) %>%
+    left_join(temp_df, by = c("vname" = "community", "date" = "date"))
+
+  lags_long %>%
+    group_by(mstudyid) %>%
+    summarise(
+      n_days = sum(!is.na(temp_metric)),
+      prop_days = n_days / total_days,
+      mean_temp = if_else(n_days > 0, mean(temp_metric, na.rm = TRUE), NA_real_),
+      .groups = "drop"
+    ) %>%
+    filter(prop_days >= min_prop_days) %>%                         # keep well-observed pregnancies
+    rename(!!paste0("mean_", metric) := mean_temp)
+}
+
+# run for both metrics (80% completeness threshold; change if you prefer)
+mean_max <- compute_participant_mean(era5, "max_t2mC", min_prop_days = 0.8)
+mean_min <- compute_participant_mean(era5, "min_t2mC", min_prop_days = 0.8)
+
+# join + factor prep
+crisis_part <- crisis_dlnm_eligible %>%
+  left_join(mean_max, by = "mstudyid") %>%
+  left_join(mean_min, by = "mstudyid") %>%
+  mutate(
+    ses_num   = as.numeric(wealthindex),
+    married_f = labelled::to_factor(married) %>% forcats::fct_drop(),
+    medlev_f  = labelled::to_factor(medlev)  %>% forcats::fct_drop(),
+    crisys_cat_f = factor(sum_nds_category, ordered = TRUE) %>% forcats::fct_drop(),
+    season_delivery = as.factor(season_delivery)
+  )
+
+# build table
+tbl1 <- crisis_part %>%
+  select(
+    age, bmi, pregchn,season_delivery, ses_num,
+    married_f, medlev_f,
+    sum_nds, crisys_cat_f,
+    mean_min_t2mC, mean_max_t2mC
+  ) %>%
+  gtsummary::tbl_summary(
+    type = list(all_continuous() ~ "continuous", all_categorical() ~ "categorical"),
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    digits = list(all_continuous() ~ 1, all_categorical() ~ 0),
+    label = list(
+      age ~ "Age (years)",
+      bmi ~ "BMI (kg/m²)",
+      pregchn ~ "Number of Previous Pregnancies",
+      season_delivery ~ "Season of Delivery",
+      ses_num ~ "SES (1–5, 1 = least poor and 5 = very poor)",
+      married_f ~ "Marital status",
+      medlev_f ~ "Education level",
+      sum_nds ~ "Sum NDS score",
+      crisys_cat_f ~ "Sum NDS category",
+      mean_min_t2mC ~ "Mean minimum t2mC (°C)",
+      mean_max_t2mC ~ "Mean maximum t2mC (°C)"
+    ),
+    missing = "ifany"
+  ) %>%
+  gtsummary::bold_labels() %>%
+  gtsummary::modify_header(
+    label ~ "**Characteristic**",
+    all_stat_cols() ~ "**Median (IQR) or n (%)**"
+  ) %>%
+  gtsummary::as_gt() %>%
+  gt::tab_options(
+    table.font.size = gt::px(12),
+    table.width = gt::pct(60),
+    heading.align = "left",
+    data_row.padding = gt::px(4),
+    column_labels.font.weight = "bold"
+  )
+
+
+
+gtsave(
+  data = tbl1,
+  filename = here("outputs", "table1_participant_exposure.rtf")
+)
+
+
+
+gtsave(tbl1, filename = here("outputs", "table1_participant_exposure.png"))  # for figures
+gtsave(tbl1, filename =here("outputs", "table1_participant_exposure.pdf"))             # for manuscript
+
+```
+
+
+
+# Compare characteristics of dlnm study participants to broader graphs cohort
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+min(crisis_dlnm_eligible$survey_date)
+max(crisis_dlnm_eligible$survey_date)
+
+# calculate midpoint of stress data so can calculate age comparison between stress sample and wider GRAPHS cohort
+start_date <- as.Date("2014-09-09")
+end_date   <- as.Date("2015-11-02")
+
+midpoint_date <- start_date + as.numeric(difftime(end_date, start_date, units = "days")) / 2
+midpoint_date
+
+
+graphs_covariates <- read_csv(here("data", "alldata_clean_for_bw_19May08.csv")) %>%
+  select(mstudyid, 
+         pregchn, # total number of lifetime pregancies 
+         dob,
+         medlev,  # educational level of mother
+         married,
+         ses,
+         asset_index,
+         is_poor,
+         bmi)
+
+
+not_included_sample <- graphs_covariates %>% 
+  filter(!mstudyid %in% c(crisis_dlnm_eligible$mstudyid)) %>%
+  mutate(
+    dob = mdy(dob),
+    age_at_reference = time_length(interval(dob, midpoint_date), "years")
+  ) %>%
+  mutate(group = "Not included in analysis (wider GRAPHS cohort)") %>%
+  mutate(
+    married = ifelse(is.na(married), 7, married),
+    medlev = ifelse(is.na(medlev), 7, medlev),
+    ses = ifelse(is.na(ses), "Unknown", ses),
+    ses = as.factor(ses),
+    
+    married_f = factor(married,
+                       levels = c(1, 2, 3, 4, 5, 6, 7),
+                       labels = c("Married", "Living together", "Widowed", "Divorced", "Separated", "Single", "Unknown")),
+
+    medlev_f = factor(
+      medlev,
+      levels = c(1, 2, 3, 4, 5, 6, 7),
+      labels = c(
+        "None", "Primary", "JHS", "SHS",
+        "Post-middle training", "Post-secondary training", "Unknown"
+      )
+    ),
+    
+  ) 
+
+library(gtsummary)
+
+table_graphs <- not_included_sample %>%
+  select(
+    age_at_reference,
+    bmi,
+    pregchn,
+    ses,
+    married_f,
+    medlev_f
+  ) %>%
+  tbl_summary(
+    type = list(
+      all_continuous() ~ "continuous",
+      all_categorical() ~ "categorical"
+    ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 1,
+      all_categorical() ~ 0
+    ),
+    label = list(
+      age_at_reference ~ "Age (years)",
+      bmi ~ "BMI (kg/m²)",
+      pregchn ~ "Number of Previous Pregnancies",
+      ses ~ "SES (1–5)",
+      married_f ~ "Marital Status",
+      medlev_f ~ "Education Level"
+    ),
+    missing = "ifany"
+  ) %>%
+  bold_labels() %>%
+  modify_header(
+    label ~ "**Characteristic**",
+    all_stat_cols() ~ "**Mean (SD) or n (%)**"
+  )
+
+table_graphs_gt <- table_graphs %>% as_gt()
+
+gtsave(
+  data = table_graphs_gt,
+  filename = here("outputs", "tables1_graphs.rtf")
+)
+
+
+
+included <- crisis_dlnm_eligible %>%
+  mutate(
+    group = "Included in analysis",
+    wealthindex = as.factor(wealthindex),
+
+    married_f = factor(
+      married,
+      levels = c(1, 2, 3, 4, 5, 6, 7),
+      labels = c("Married", "Living together", "Widowed",
+                 "Divorced", "Separated", "Single", "Unknown")
+    ),
+
+    medlev_f = factor(
+      medlev,
+      levels = c(1, 2, 3, 4, 5, 6, 7),
+      labels = c("None", "Primary", "JHS", "SHS",
+                 "Post-middle training", "Post-secondary training", "Unknown")
+    )
+  ) %>%
+  select(
+    group,
+    age,
+    bmi,
+    pregchn,
+    wealthindex,
+    married_f,
+    medlev_f
+  )
+
+
+excluded <- not_included_sample %>%
+  rename(age = age_at_reference,
+         wealthindex = ses) %>%
+  mutate(group = "zExcluded from analysis (wider GRAPHS cohort)") %>%
+  select(
+    group,
+    age,
+    bmi,
+    pregchn,
+    wealthindex,
+    married_f,
+    medlev_f
+  )
+
+
+comparison_df <- bind_rows(included, excluded)
+
+library(gtsummary)
+
+combined_table <- comparison_df %>%
+  tbl_summary(
+    by = group,
+    type = list(
+      all_continuous() ~ "continuous",
+      all_categorical() ~ "categorical"
+    ),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "ifany",
+    label = list(
+      age ~ "Age (years)",
+      bmi ~ "BMI (kg/m²)",
+      pregchn ~ "Number of Previous Pregnancies",
+      wealthindex ~ "SES (1–5)",
+      married_f ~ "Marital Status",
+      medlev_f ~ "Education Level"
+    )
+  ) %>%
+  bold_labels() %>%
+  modify_header(
+    label ~ "**Characteristic**",
+    all_stat_cols() ~ "**Mean (SD) or n (%)**"
+  )
+
+combined_table_gt <- combined_table %>% as_gt()
+
+
+
+gtsave(
+  data = combined_table_gt,
+  filename = here("outputs", "table_s1_graphs_comparison.rtf")
+)
+
+
+# summary_table <- combined_samples %>%
+#   group_by(group) %>%
+#   summarise(
+#     n = n(),
+#     `Age (years)` = sprintf("%.1f (%.1f)", mean(age_at_reference, na.rm = TRUE), sd(age_at_reference, na.rm = TRUE)),
+#     `BMI (kg/m²)` = sprintf("%.1f (%.1f)", mean(bmi, na.rm = TRUE), sd(bmi, na.rm = TRUE)),
+#     `SES (1–5)` = sprintf("%.2f (%.2f)", mean(ses, na.rm = TRUE), sd(ses, na.rm = TRUE)),
+#     `Pregnancies (n)` = sprintf("%.1f (%.1f)", mean(pregchn, na.rm = TRUE), sd(pregchn, na.rm = TRUE)),
+#     `Married (%)` = sprintf("%.0f%%", 100 * mean(married == 1, na.rm = TRUE))
+#   )
+# 
+# table_s1 <- summary_table %>%
+#   t() %>%
+#   as.data.frame() %>%
+#   rownames_to_column("Characteristic")
+# 
+# names(table_s1) <- c("Characteristic", "Included in analysis", "Not included in analysis (wider GRAPHS cohort)")
+# 
+# table_s1 <- table_s1[-1, ]  # remove the 'group' row
+# 
+# 
+# table_graphs_comp_s1 <- table_s1 %>%
+#   kable(
+#     format = "html",
+#     align = "lcc",
+#     row.names = FALSE   # 👈 This removes the numbered row names
+#   ) %>%
+#   kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+#   kable_styling(font_size = 15) %>%
+#   footnote(
+#     general_title = "",
+#     footnote_as_chunk = TRUE,
+#     escape = FALSE
+#   )
+# 
+# 
+# 
+# # Save as high-resolution PNG for Word
+# save_kable(
+#   table_graphs_comp_s1,
+#   file = here("outputs", "tables1_graphs_crysis_comp.png"),
+#   zoom = 3,             # higher = higher DPI
+#   vwidth = 800,        # width in pixels (default ~992)
+#   vheight = 500,        # height in pixels
+#   density = 300         # DPI for high-res output
+# )
+# 
+# # Save as PDF
+# save_kable(table_graphs_comp_s1, file = here("outputs", "tables1_graphs_crysis_comp.pdf"), self_contained = TRUE)
+```
+
+
+
+
+

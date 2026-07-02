@@ -1,0 +1,975 @@
+---
+title: "Comparison DLNM params"
+output: 
+  html_document:
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# Load necessary libraries
+library(readxl)     # reading Excel files
+library(tidyverse)      # data manipulation
+library(labelled)   # labeling columns 
+library(here) # file paths
+library(haven)
+library(stargazer)
+library(dlnm)
+library(data.table)
+library(forcats) # For reordering factor levels
+library(broom)
+library(MASS)
+library(brant) # test proportional odds assumption for ordinal logistic regression
+library(gt)
+library(patchwork)
+# source in code to load and clean data
+
+## override mass::select and use dplyr as default
+select <- dplyr::select 
+
+source(here("data_cleaning", "clean_stress_data.R")) # pss_recode and crisis_recode and the output datasets of interest
+
+
+# load selected temp data
+era5 <- read_csv(here("data", "GRAPHS-ERA5-CHIRPS", "GRAPHS-ERA5-Heatstress-Tw-1991missing.csv")) %>%
+  filter(date > as.Date("2013-01-01")) %>%
+  mutate(community = case_when(community == "AKORA/AT" ~ "AKORA",
+                               TRUE ~ community))
+
+# load in precip data 
+precip <- read_csv(here("data", "GRAPHS-ERA5-CHIRPS", "GRAPHS-CHIRPS-Precip.csv")) 
+
+precip_clean <- precip %>%
+  select(community, date, precip) %>%
+  filter(date > as.Date("2013-01-01")) %>%
+  mutate(date = lubridate::ymd(date),
+         month = lubridate::month(date))%>%
+  mutate(community = case_when(community == "AKORA/AT" ~ "AKORA",
+                               TRUE ~ community))
+
+# check definition of rainy season 
+precip_clean_summary <- precip_clean %>%
+  group_by(month) %>%
+  summarise(total_precip = sum(precip))
+
+# load selected temp data
+WBGT_daily_max <- era5 %>%
+  dplyr::select(community, date, max_wbgt)  # select relevant columns
+
+WBGT_daily_mean <- era5 %>%
+  dplyr::select(community, date, mean_wbgt)  # select relevant columns
+
+WBGT_daily_min <- era5 %>%
+  dplyr::select(community, date, min_wbgt)  # select relevant columns
+
+```
+
+
+## Sum NDS Category
+
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+### LOAD THE CRYSIS DATA
+
+## CRYSIS data
+crisis_simple <- crisis_recode %>%
+  mutate(
+    quessetdt = sprintf("%04d", quessetdt),  # Ensure quassetdt has 4 digits
+    quessetdt = sub("(\\d{2})(\\d{2})", "\\1:\\2", quessetdt),  # Insert colon
+    survey_datetime = as.POSIXct(paste(quessetd, quessetdt), format = "%Y-%m-%d %H:%M")) %>%
+    select(mstudyid, fin_events:survey_datetime, datdeliv:survey_pre_post_birth, gestage_days, date_conception, married, wealthindex, age, bmi, medlev, fan, pregchn) %>%
+  select(-c(crireadneg:crikidneg)) %>%
+  mutate(month_delivery = lubridate::month(datdeliv),
+         season_delivery = case_when(month_delivery %in% c(4,5,6,7,8,9,10) ~ "wet", 
+                                     month_delivery %in% c(1,2,3,11,12) ~"dry",
+                                     TRUE ~ NA)) %>%
+  mutate(survey_date = as.Date(survey_datetime))  # Extract the date part of survey_datetime
+
+
+
+```
+
+### T
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+## Create Daily Lag Frame:
+max_gestation_days <- 210
+pre_conception_days <- 30
+
+crisis_dlnm_eligible <- crisis_simple %>% 
+  filter(gestage_days >= max_gestation_days) # ~37 weeks
+
+
+# Function to process temperature data for the selected metric
+process_temperature_data <- function(era5_data, metric) {
+  era5_data %>%
+    select(community, date, !!sym(metric)) %>%
+    rename(temp_metric = !!sym(metric)) %>%
+    distinct()
+}
+
+# Process temp data
+temp_data_clean <- process_temperature_data(era5_data = era5, metric = "max_wbgt")
+
+
+
+# Generate lags relative to conception
+create_conception_aligned_lags <- function(df, temp_df) {
+  df %>%
+    select(mstudyid, vname, date_conception) %>%
+    rowwise() %>%
+    mutate(day_relative = list(-pre_conception_days:max_gestation_days),
+           date = list(date_conception + day_relative)) %>%
+    unnest(c(day_relative, date)) %>%
+    left_join(temp_df, by = c("vname" = "community", "date" = "date"))  # join temp
+}
+
+
+temp_lags_long <- create_conception_aligned_lags(crisis_dlnm_eligible, temp_data_clean)
+
+# Step 4: Pivot to wide format (like DLNM expects)
+temperature_lags_wide <- temp_lags_long %>%
+  select(mstudyid, date_conception, day_relative, temp_metric) %>%
+  pivot_wider(
+    names_from = day_relative,
+    values_from = temp_metric,
+    names_prefix = "day_"
+  ) %>%
+  left_join(crisis_dlnm_eligible %>% select(mstudyid, sum_nds_category, age, bmi, wealthindex, season_delivery), by = "mstudyid") %>%
+  filter(!is.na(day_0))
+
+temp_data_matrix <- temperature_lags_wide %>%
+  select(starts_with("day_")) %>%
+  as.matrix()
+
+```
+
+
+## function to examine BIC for range of models to optimize DLNM parameters
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+## Create a grid-search function for ordinal logistic regression (polr)
+fit_DLNMs_polr <- function(args_list, exposure_data, min_lag, max_lag,
+                           model_data, outcome, covars, verbose = TRUE) {
+  
+  num_args <- length(args_list)
+  combos <- expand.grid(var = 1:num_args, lag = 1:num_args)
+  
+  results <- tibble(
+    DLNM_argvar = character(),
+    DLNM_arglag = character(),
+    AIC = numeric(),
+    BIC = numeric()
+  )
+  
+  for (i in seq_len(nrow(combos))) {
+    var_i <- combos$var[i]
+    lag_i <- combos$lag[i]
+    
+    cb <- crossbasis(
+      exposure_data,
+      lag = c(min_lag, max_lag),
+      argvar = args_list[[var_i]],
+      arglag = args_list[[lag_i]]
+    )
+    
+    formula_str <- paste(outcome, "~ cb +", paste(covars, collapse = " + "))
+    model <- polr(as.formula(formula_str), data = model_data, method = "logistic")
+    
+    results <- add_row(
+      results,
+      DLNM_argvar = paste(names(args_list[[var_i]]), args_list[[var_i]], collapse = ", "),
+      DLNM_arglag = paste(names(args_list[[lag_i]]), args_list[[lag_i]], collapse = ", "),
+      AIC = AIC(model),
+      BIC = BIC(model)
+    )
+  }
+  
+  best_BIC <- results %>% filter(BIC == min(BIC, na.rm = TRUE))
+  best_AIC <- results %>% filter(AIC == min(AIC, na.rm = TRUE))
+  
+  if (verbose) {
+    cat("\nLowest BIC model:\n")
+    print(best_BIC)
+    cat("\nLowest AIC model:\n")
+    print(best_AIC)
+  }
+  
+  list(results = results, best_BIC = best_BIC, best_AIC = best_AIC)
+}
+```
+
+### Run the search
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+## Define the parameter grid 
+args <- list(
+  list(fun = "bs", df = 3, degree = 2),
+  list(fun = "bs", df = 4, degree = 2),
+  list(fun = "bs", df = 4, degree = 3),
+  list(fun = "bs", df = 5, degree = 2),
+  list(fun = "bs", df = 5, degree = 3),
+  list(fun = "bs", df = 5, degree = 4),
+  list(fun = "bs", df = 6, degree = 3),
+  list(fun = "bs", df = 6, degree = 4),
+  list(fun = "bs", df = 6, degree = 5)
+)
+
+dlnm_search <- fit_DLNMs_polr(
+  args_list = args,
+  exposure_data = temp_data_matrix,
+  min_lag = 0,
+  max_lag = ncol(temp_data_matrix) - 1,
+  model_data = temperature_lags_wide,
+  outcome = "sum_nds_category",
+  covars = c("age", "bmi", "wealthindex", "season_delivery")
+)
+
+
+dlnm_search$results %>%
+  arrange(BIC)
+
+
+# try again with natural spline
+# Define natural spline options (df indicates knots are used)
+ns_args <- list(
+  list(fun = "ns", df = 2),
+  list(fun = "ns", df = 3),
+  list(fun = "ns", df = 4),
+  list(fun = "ns", df = 5)
+)
+
+# Run DLNM parameter search with natural spline basis
+dlnm_search_ns <- fit_DLNMs_polr(
+  args_list = ns_args,
+  exposure_data = temp_data_matrix,
+  min_lag = 0,
+  max_lag = ncol(temp_data_matrix) - 1,
+  model_data = temperature_lags_wide,
+  outcome = "sum_nds_category",
+  covars = c("age", "bmi", "wealthindex", "season_delivery")
+)
+
+dlnm_search_ns$results %>%
+  arrange(BIC)
+
+```
+
+
+### function to plot contours 
+
+```{r}
+plot_dlnm_model <- function(var_fun, var_df, lag_fun, lag_df, 
+                            temp_data_matrix, data_df, outcome, covars) {
+
+  cb <- crossbasis(
+    temp_data_matrix,
+    lag   = c(0, ncol(temp_data_matrix) - 1),
+    argvar = list(fun = var_fun, df = var_df),
+    arglag = list(fun = lag_fun, df = lag_df)
+  )
+
+  f <- as.formula(paste(outcome, "~ cb +", paste(covars, collapse = " + ")))
+  model <- MASS::polr(f, data = data_df, method = "logistic", Hess = TRUE)
+
+  temp_median <- round(median(as.vector(temp_data_matrix)), 1)
+
+  ## Let crosspred extract coef/vcov from the polr model:
+  cpred <- dlnm::crosspred(cb, model, cen = temp_median, ci.level = 0.95, by = 0.1)
+
+  plot(cpred, "contour",
+       main = paste0("DLNM (", var_fun, " df=", var_df, ", ", lag_fun, " df=", lag_df, ")\n",
+                     "Relative to median ", temp_median, "°C"),
+       xlab = "Temperature (°C)", ylab = "Days relative to conception",
+       key.title = title(main = "Change in\nLog Odds", cex.main = 0.8))
+
+  invisible(list(model = model, cpred = cpred))
+}
+
+
+# PLOTS OF TOP MODELS
+plot_dlnm_model("ns", 2, "ns", 2, temp_data_matrix, temperature_lags_wide,
+                "sum_nds_category", c("age","bmi","wealthindex","season_delivery")) # oversimplifies
+
+plot_dlnm_model("ns", 4, "ns", 2, temp_data_matrix, temperature_lags_wide,
+                "sum_nds_category", c("age","bmi","wealthindex","season_delivery"))
+
+plot_dlnm_model("ns", 4, "ns", 3, temp_data_matrix, temperature_lags_wide,
+                "sum_nds_category", c("age","bmi","wealthindex","season_delivery"))
+
+plot_dlnm_model("ns", 5, "ns", 2, temp_data_matrix, temperature_lags_wide,
+                "sum_nds_category", c("age","bmi","wealthindex","season_delivery"))
+
+```
+
+
+
+```{r}
+library(MASS)
+library(dlnm)
+library(tidyverse)
+
+# Fit one DLNM and return cpred + label
+fit_cpred <- function(var_df, lag_df, var_fun = "ns", lag_fun = "ns",
+                      temp_data_matrix, data_df, outcome, covars,
+                      center = c("median","tmin")) {
+  center <- match.arg(center)
+
+  cb <- crossbasis(
+    temp_data_matrix,
+    lag   = c(0, ncol(temp_data_matrix) - 1),
+    argvar = list(fun = var_fun, df = var_df),
+    arglag = list(fun = lag_fun, df = lag_df)
+  )
+
+  f <- as.formula(paste(outcome, "~ cb +", paste(covars, collapse = " + ")))
+  model <- MASS::polr(f, data = data_df, method = "logistic", Hess = TRUE)
+
+  # choose centering
+  temp_vec <- as.vector(temp_data_matrix)
+  if (center == "median") {
+    cen_val <- round(median(temp_vec), 1)
+  } else {
+    # Tmin (temp of minimum predicted risk) using a quick median-centered cpred
+    tmp <- crosspred(cb, model, cen = round(median(temp_vec), 1), by = 0.1)
+    cen_val <- as.numeric(names(which.min(tmp$allRRfit)))
+  }
+
+  cpred <- crosspred(cb, model, cen = cen_val, ci.level = 0.95, by = 0.1)
+
+  list(
+  label = sprintf("df = %d, lag = %d", var_df, lag_df),
+  var_df = var_df, lag_df = lag_df,
+  model = model, cb = cb, cpred = cpred, cen = cen_val
+)
+}
+
+
+center_suffix <- function(fits) {
+  cents <- vapply(fits, function(x) x$cen, numeric(1))
+  cents_u <- unique(round(cents, 1))
+  if (length(cents_u) == 1) {
+    sprintf(" (center = %.1f°C)", cents_u)
+  } else {
+    sprintf(" (centers = %s°C)", paste(format(cents_u, nsmall = 1), collapse = ", "))
+  }
+}
+
+# Helper: safely pull a row from cpred at a temperature value,
+# falling back to the nearest available temp if exact match is absent
+extract_temp_row <- function(cpred, target_temp) {
+  temps <- as.numeric(rownames(cpred$matfit))
+  idx <- which.min(abs(temps - target_temp))
+  list(idx = idx, temp = temps[idx])
+}
+
+
+
+# Build lag-slice data for one cpred at one temperature percentile
+lag_slice_df <- function(cpred, percentile, temp_data_matrix, label){
+  target <- quantile(as.vector(temp_data_matrix), percentile/100)
+  take <- extract_temp_row(cpred, round(as.numeric(target), 1))
+
+  fit  <- cpred$matfit[take$idx, ]
+  low  <- cpred$matlow[take$idx, ]
+  high <- cpred$mathigh[take$idx, ]
+
+  tibble(
+    lag = as.numeric(gsub("lag", "", names(fit))),
+    effect = as.numeric(fit),
+    ci_low = as.numeric(low),
+    ci_high = as.numeric(high),
+    model = label,
+    temp_value = take$temp,
+    percentile = percentile
+  )
+}
+
+ordinal <- function(n){
+  n <- as.integer(n)
+  suffix <- ifelse(
+    n %% 100L %in% c(11L, 12L, 13L),
+    "th",
+    c("th", "st", "nd", "rd", "th")[pmin(5, (n %% 10L) + 1)]
+  )
+  paste0(n, suffix)
+}
+
+# OVERLAY plots for multiple models at chosen percentiles
+plot_lag_slices_across_models <- function(fits, temp_data_matrix,
+                                          percentiles = c(1, 25, 75, 99),
+                                          main_prefix = "Lag-response at temp percentiles",
+                                          ylims = NULL,
+                                          legend_top = TRUE) {
+  # gather all slices
+  all <- purrr::map_dfr(fits, function(x) {
+    purrr::map_dfr(percentiles, ~ lag_slice_df(x$cpred, .x, temp_data_matrix, x$label))
+  })
+
+  if (is.null(ylims)) {
+    ylims <- range(c(all$ci_low, all$ci_high), finite = TRUE)
+  }
+
+  title_text <- paste0(main_prefix, center_suffix(fits))
+
+  
+  p <- all %>%
+    dplyr::mutate(
+      panel = factor(paste0(ordinal(percentile), " (", sprintf("%.1f", temp_value), "°C)"), levels = unique(paste0(
+        ordinal(percentiles),
+        " (",
+        sprintf("%.1f", purrr::map_dbl(
+          percentiles, ~ stats::quantile(as.vector(temp_data_matrix), .x / 100)
+        )),
+        "°C)"
+      )))
+    ) %>%
+    ggplot2::ggplot(ggplot2::aes(lag, effect, color = model, fill = model)) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, color = NA) +
+    ggplot2::geom_line(size = 1) +
+    ggplot2::facet_wrap(~ panel, scales = "fixed") +
+    ggplot2::geom_hline(yintercept = 0, linetype = 2) +
+    ggplot2::coord_cartesian(ylim = ylims) +
+    ggplot2::labs(x = "Days relative to conception (0 = 30 days before)",
+                  y = "Change in log-odds (vs. center)", color = "Model", fill = "Model") +
+    ggplot2::theme_minimal(base_size = 12)
+
+  if (legend_top) {
+    p <- p +
+      labs(color = "Spline specification", fill = "Spline specification") +
+      theme(
+        legend.position = "top",
+        legend.box = "horizontal",
+        legend.text = element_text(size = 11),
+        legend.title = element_text(size = 11, face = "bold"),
+        legend.key.width = unit(1.2, "cm"),
+        legend.spacing.x = unit(0.3, "cm"),
+        axis.text = element_text(size = 11.5),
+        axis.title = element_text(size = 12.5)
+      ) +
+      guides(color = guide_legend(nrow = 1, byrow = TRUE),
+             fill  = guide_legend(nrow = 1, byrow = TRUE))
+  }
+  p
+}
+
+
+
+# ggplot-friendly exposure slices produced by dlnm's slicer
+exposure_slice_df <- function(cpred, lag_value, label){
+  # dlnm's base plotter computes slices internally, but we can emulate via $allRR...
+  # Here we call dlnm's base slicer, capture values, or reconstruct from cpred fields.
+  # Simpler approach: use the "slices" method to compute values and capture via grDevices.
+  # Instead, we rebuild from cpred$matfit columns = lags; rows = temperatures:
+  lags <- as.numeric(gsub("lag", "", colnames(cpred$matfit)))
+  j <- which.min(abs(lags - lag_value))  # nearest lag column
+
+  tibble(
+    temp = as.numeric(rownames(cpred$matfit)),
+    effect = cpred$matfit[, j],
+    ci_low = cpred$matlow[, j],
+    ci_high = cpred$mathigh[, j],
+    model = label,
+    lag = lags[j]
+  )
+}
+
+plot_exposure_slices_across_models <- function(
+  fits, lags = c(0, 7, 30, 100, 200),
+  main_prefix = "Exposure-response at fixed lags",
+  ylims = NULL,
+  legend_top = TRUE,
+  free_y = FALSE
+) {
+  all <- purrr::map_dfr(fits, function(x) {
+    purrr::map_dfr(lags, ~ exposure_slice_df(x$cpred, .x, x$label))
+  })
+
+  # global y limits only if we're NOT using free_y
+  if (!free_y) {
+    if (is.null(ylims)) ylims <- range(c(all$ci_low, all$ci_high), finite = TRUE)
+  }
+
+  title_text <- paste0(main_prefix, center_suffix(fits))
+
+  p <- all %>%
+    dplyr::mutate(panel = factor(paste0("Lag ", lag, " d"),
+                                 levels = paste0("Lag ", sort(unique(all$lag)), " d"))) %>%
+    ggplot2::ggplot(ggplot2::aes(temp, effect, color = model, fill = model)) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, color = NA) +
+    ggplot2::geom_line(size = 1) +
+    ggplot2::facet_wrap(~ panel, scales = if (free_y) "free_y" else "fixed") +
+    ggplot2::geom_hline(yintercept = 0, linetype = 2) +
+    ggplot2::labs(y = "Change in log-odds (vs. center)", 
+                  x = "Daily maximum WBGT (°C)",
+                  color = "Model", 
+                  fill = "Model") +
+    ggplot2::theme_minimal(base_size = 12)
+
+  if (!free_y) {
+    p <- p + ggplot2::coord_cartesian(ylim = ylims)
+  }
+
+  if (legend_top) {
+    p <- p +
+      labs(color = "Spline specification", fill = "Spline specification") +
+      theme(
+        legend.position = "top",
+        legend.box = "horizontal",
+        legend.text = element_text(size = 11),
+        legend.title = element_text(size = 11, face = "bold"),
+        legend.key.width = unit(1.2, "cm"),
+        legend.spacing.x = unit(0.3, "cm"),
+        axis.text = element_text(size = 11.5),
+        axis.title = element_text(size = 12.5)
+      ) +
+      guides(color = guide_legend(nrow = 1, byrow = TRUE),
+             fill  = guide_legend(nrow = 1, byrow = TRUE))
+  }
+  p
+}
+
+
+```
+
+
+```{r}
+# Build cpred objects for the four models (center at median for comparability)
+fits <- list(
+  fit_cpred(3, 3, temp_data_matrix = temp_data_matrix,
+            data_df = temperature_lags_wide,
+            outcome = "sum_nds_category",
+            covars = c("age","bmi","wealthindex","season_delivery"),
+            center = "median"),
+  # fit_cpred(5, 4, temp_data_matrix = temp_data_matrix,
+  #           data_df = temperature_lags_wide,
+  #           outcome = "sum_nds_category",
+  #           covars = c("age","bmi","wealthindex","season_delivery"),
+  #           center = "median"),
+  fit_cpred(4, 3, temp_data_matrix = temp_data_matrix,
+            data_df = temperature_lags_wide,
+            outcome = "sum_nds_category",
+            covars = c("age","bmi","wealthindex","season_delivery"),
+            center = "median"),
+  fit_cpred(5, 3, temp_data_matrix = temp_data_matrix,
+            data_df = temperature_lags_wide,
+            outcome = "sum_nds_category",
+            covars = c("age","bmi","wealthindex","season_delivery"),
+            center = "median"),
+  fit_cpred(4, 4, temp_data_matrix = temp_data_matrix,
+            data_df = temperature_lags_wide,
+            outcome = "sum_nds_category",
+            covars = c("age","bmi","wealthindex","season_delivery"),
+            center = "median")
+)
+
+# Choose a common y-limit across all models for fair visual comparison
+# (you can widen/narrow this after seeing first render)
+lag_plot <- plot_lag_slices_across_models(fits, temp_data_matrix,
+                                          percentiles = c(1,25,75,99))
+
+exposure_plot <- plot_exposure_slices_across_models(
+  fits, lags = c(7, 30, 90, 150, 200, 275),
+  main_prefix = "Exposure-response at fixed lags",
+  free_y = TRUE
+)
+
+
+
+final_sensitivity_plot <-
+  (lag_plot / exposure_plot) +                    # combine first
+  plot_annotation(
+    tag_levels = 'A',                             # auto-tags A, B
+    #title = "Spline sensitivity analysis for Max WBGT",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.tag = element_text(face = "bold", size = 12)  # style A/B
+    )
+  )
+
+# Save Figure S1 (lag-response)
+ggsave(
+  filename = "S1_max_WBGT_sensitivity_new.png",
+  plot = final_sensitivity_plot,
+  path = here("outputs"),
+  width =11,                 # in inches
+  height = 8,
+  dpi = 600,                 # high resolution for print/PDF
+  bg = "white"
+)
+
+ggsave(
+  filename = "Figure_S1_new.pdf",
+  plot = final_sensitivity_plot,
+  path = here("outputs"),  
+  width = 11,
+  height = 9,
+  bg = "white"
+)
+
+
+
+```
+
+## update titles
+
+```{r}
+lag_plot_final <- lag_plot +
+  labs(title = "Figure S1. Lag–response Functions at Temperature Percentiles for Alternative Spline Specifications.",
+       caption = "Curves show the change in log-odds of higher stress relative to 27.4 °C, across gestation. The comparison demonstrates that the ns(4) × ns(3) \nmodel best captures meaningful lag structure without overfitting.")
+
+
+exposure_plot_final <- exposure_plot +
+  labs(title ="Figure S2. Exposure–response Functions at Fixed Lags for the Same Spline Specifications.",
+       caption = "Curves show the change in log-odds of higher stress relative to 27.4 °C at selected lag days. Y-axis scales vary by panel to emphasize curve shape; \nmagnitudes should be compared within, not across, panels. These results complement Figure S1, showing consistent exposure–response patterns \nacross spline choices, with the ns(4) × ns(3) model providing balanced flexibility.")
+
+
+
+# Save Figure S1 (lag-response)
+ggsave(
+  filename = "max_WBGT_sensitivity_lag_response.png",
+  plot = lag_plot,
+  path = here("outputs"),  
+  width =11,                 # in inches
+  height = 6,
+  dpi = 600,                 # high resolution for print/PDF
+  bg = "white"
+)
+
+# Save Figure S2 (exposure-response)
+ggsave(
+  filename = "max_WBGT_sensitivity_exposure_response.png",
+  plot = exposure_plot,
+  path = here("outputs"),
+  width = 11,
+  height = 6,
+  dpi = 600,
+  bg = "white"
+)
+
+```
+
+
+### Min WBGT
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+## Create Daily Lag Frame:
+max_gestation_days <- 210
+pre_conception_days <- 30
+
+crisis_dlnm_eligible <- crisis_simple %>% 
+  filter(gestage_days >= max_gestation_days) # ~37 weeks
+
+
+# Function to process temperature data for the selected metric
+process_temperature_data <- function(era5_data, metric) {
+  era5_data %>%
+    select(community, date, !!sym(metric)) %>%
+    rename(temp_metric = !!sym(metric)) %>%
+    distinct()
+}
+
+# Process temp data
+temp_data_clean <- process_temperature_data(era5_data = era5, metric = "min_wbgt")
+
+
+
+# Generate lags relative to conception
+create_conception_aligned_lags <- function(df, temp_df) {
+  df %>%
+    select(mstudyid, vname, date_conception) %>%
+    rowwise() %>%
+    mutate(day_relative = list(-pre_conception_days:max_gestation_days),
+           date = list(date_conception + day_relative)) %>%
+    unnest(c(day_relative, date)) %>%
+    left_join(temp_df, by = c("vname" = "community", "date" = "date"))  # join temp
+}
+
+
+temp_lags_long <- create_conception_aligned_lags(crisis_dlnm_eligible, temp_data_clean)
+
+# Step 4: Pivot to wide format (like DLNM expects)
+temperature_lags_wide <- temp_lags_long %>%
+  select(mstudyid, date_conception, day_relative, temp_metric) %>%
+  pivot_wider(
+    names_from = day_relative,
+    values_from = temp_metric,
+    names_prefix = "day_"
+  ) %>%
+  left_join(crisis_dlnm_eligible %>% select(mstudyid, sum_nds_category, age, bmi, wealthindex, season_delivery), by = "mstudyid") %>%
+  filter(!is.na(day_0))
+
+temp_data_matrix <- temperature_lags_wide %>%
+  select(starts_with("day_")) %>%
+  as.matrix()
+
+```
+
+
+## function to examine BIC for range of models to optimize DLNM parameters
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+## Create a grid-search function for ordinal logistic regression (polr)
+fit_DLNMs_polr <- function(args_list, exposure_data, min_lag, max_lag,
+                           model_data, outcome, covars, verbose = TRUE) {
+  
+  num_args <- length(args_list)
+  combos <- expand.grid(var = 1:num_args, lag = 1:num_args)
+  
+  results <- tibble(
+    DLNM_argvar = character(),
+    DLNM_arglag = character(),
+    AIC = numeric(),
+    BIC = numeric()
+  )
+  
+  for (i in seq_len(nrow(combos))) {
+    var_i <- combos$var[i]
+    lag_i <- combos$lag[i]
+    
+    cb <- crossbasis(
+      exposure_data,
+      lag = c(min_lag, max_lag),
+      argvar = args_list[[var_i]],
+      arglag = args_list[[lag_i]]
+    )
+    
+    formula_str <- paste(outcome, "~ cb +", paste(covars, collapse = " + "))
+    model <- polr(as.formula(formula_str), data = model_data, method = "logistic")
+    
+    results <- add_row(
+      results,
+      DLNM_argvar = paste(names(args_list[[var_i]]), args_list[[var_i]], collapse = ", "),
+      DLNM_arglag = paste(names(args_list[[lag_i]]), args_list[[lag_i]], collapse = ", "),
+      AIC = AIC(model),
+      BIC = BIC(model)
+    )
+  }
+  
+  best_BIC <- results %>% filter(BIC == min(BIC, na.rm = TRUE))
+  best_AIC <- results %>% filter(AIC == min(AIC, na.rm = TRUE))
+  
+  if (verbose) {
+    cat("\nLowest BIC model:\n")
+    print(best_BIC)
+    cat("\nLowest AIC model:\n")
+    print(best_AIC)
+  }
+  
+  list(results = results, best_BIC = best_BIC, best_AIC = best_AIC)
+}
+```
+
+### Run the search
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+## Define the parameter grid 
+args <- list(
+  list(fun = "bs", df = 3, degree = 2),
+  list(fun = "bs", df = 4, degree = 2),
+  list(fun = "bs", df = 4, degree = 3),
+  list(fun = "bs", df = 5, degree = 2),
+  list(fun = "bs", df = 5, degree = 3),
+  list(fun = "bs", df = 5, degree = 4),
+  list(fun = "bs", df = 6, degree = 3),
+  list(fun = "bs", df = 6, degree = 4),
+  list(fun = "bs", df = 6, degree = 5)
+)
+
+dlnm_search <- fit_DLNMs_polr(
+  args_list = args,
+  exposure_data = temp_data_matrix,
+  min_lag = 0,
+  max_lag = ncol(temp_data_matrix) - 1,
+  model_data = temperature_lags_wide,
+  outcome = "sum_nds_category",
+  covars = c("age", "bmi", "wealthindex", "season_delivery")
+)
+
+
+dlnm_search$results %>%
+  arrange(BIC)
+
+
+# try again with natural spline
+# Define natural spline options (df indicates knots are used)
+ns_args <- list(
+  list(fun = "ns", df = 2),
+  list(fun = "ns", df = 3),
+  list(fun = "ns", df = 4),
+  list(fun = "ns", df = 5)
+)
+
+# Run DLNM parameter search with natural spline basis
+dlnm_search_ns <- fit_DLNMs_polr(
+  args_list = ns_args,
+  exposure_data = temp_data_matrix,
+  min_lag = 0,
+  max_lag = ncol(temp_data_matrix) - 1,
+  model_data = temperature_lags_wide,
+  outcome = "sum_nds_category",
+  covars = c("age", "bmi", "wealthindex", "season_delivery")
+)
+
+dlnm_search_ns$results %>%
+  arrange(BIC)
+
+```
+
+
+```{r}
+# Build cpred objects for the four models (center at median for comparability)
+
+
+plot_exposure_slices_across_models <- function(
+  fits, lags = c(0, 7, 30, 100, 200),
+  main_prefix = "Exposure-response at fixed lags",
+  ylims = NULL,
+  legend_top = TRUE,
+  free_y = FALSE
+) {
+  all <- purrr::map_dfr(fits, function(x) {
+    purrr::map_dfr(lags, ~ exposure_slice_df(x$cpred, .x, x$label))
+  })
+
+  # global y limits only if we're NOT using free_y
+  if (!free_y) {
+    if (is.null(ylims)) ylims <- range(c(all$ci_low, all$ci_high), finite = TRUE)
+  }
+
+  title_text <- paste0(main_prefix, center_suffix(fits))
+
+  p <- all %>%
+    dplyr::mutate(panel = factor(paste0("Lag ", lag, " d"),
+                                 levels = paste0("Lag ", sort(unique(all$lag)), " d"))) %>%
+    ggplot2::ggplot(ggplot2::aes(temp, effect, color = model, fill = model)) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, color = NA) +
+    ggplot2::geom_line(size = 1) +
+    ggplot2::facet_wrap(~ panel, scales = if (free_y) "free_y" else "fixed") +
+    ggplot2::geom_hline(yintercept = 0, linetype = 2) +
+    ggplot2::labs(y = "Change in log-odds (vs. center)", 
+                  x = "Daily minimum WBGT (°C)",
+                  color = "Model", 
+                  fill = "Model") +
+    ggplot2::theme_minimal(base_size = 12)
+
+  if (!free_y) {
+    p <- p + ggplot2::coord_cartesian(ylim = ylims)
+  }
+
+  if (legend_top) {
+    p <- p +
+      labs(color = "Spline specification", fill = "Spline specification") +
+      theme(
+        legend.position = "top",
+        legend.box = "horizontal",
+        legend.text = element_text(size = 11),
+        legend.title = element_text(size = 11, face = "bold"),
+        legend.key.width = unit(1.2, "cm"),
+        legend.spacing.x = unit(0.3, "cm"),
+        axis.text = element_text(size = 11.5),
+        axis.title = element_text(size = 12.5)
+      ) +
+      guides(color = guide_legend(nrow = 1, byrow = TRUE),
+             fill  = guide_legend(nrow = 1, byrow = TRUE))
+  }
+  p
+}
+
+
+
+fits <- list(
+  fit_cpred(3, 3, temp_data_matrix = temp_data_matrix,
+            data_df = temperature_lags_wide,
+            outcome = "sum_nds_category",
+            covars = c("age","bmi","wealthindex","season_delivery"),
+            center = "median"),
+  fit_cpred(4, 3, temp_data_matrix = temp_data_matrix,
+            data_df = temperature_lags_wide,
+            outcome = "sum_nds_category",
+            covars = c("age","bmi","wealthindex","season_delivery"),
+            center = "median"),
+  fit_cpred(5, 3, temp_data_matrix = temp_data_matrix,
+            data_df = temperature_lags_wide,
+            outcome = "sum_nds_category",
+            covars = c("age","bmi","wealthindex","season_delivery"),
+            center = "median"),
+  fit_cpred(4, 4, temp_data_matrix = temp_data_matrix,
+            data_df = temperature_lags_wide,
+            outcome = "sum_nds_category",
+            covars = c("age","bmi","wealthindex","season_delivery"),
+            center = "median")
+)
+
+# Choose a common y-limit across all models for fair visual comparison
+# (you can widen/narrow this after seeing first render)
+lag_plot <- plot_lag_slices_across_models(fits, temp_data_matrix,
+                                          percentiles = c(1,25,75,99))
+
+exposure_plot <- plot_exposure_slices_across_models(
+  fits, lags = c(7, 30, 90, 150, 200, 275),
+  main_prefix = "Exposure-response at fixed lags",
+  free_y = TRUE
+)
+
+
+final_sensitivity_plot <-
+  (lag_plot / exposure_plot) +                    # combine first
+  plot_annotation(
+    tag_levels = 'A',                             # auto-tags A, B
+    #title = "Spline sensitivity analysis for Min WBGT",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.tag = element_text(face = "bold", size = 12)  # style A/B
+    )
+  )
+
+## pdf save
+ggsave(
+  filename = "Figure_S2_new.pdf",
+  plot = final_sensitivity_plot,
+  path = here("outputs"),  
+  width = 11,
+  height = 9,
+  bg = "white"
+)
+# 
+# 
+# # Save Figure S1 (lag-response)
+# ggsave(
+#   filename = "min_WBGT_sensitivity.png",
+#   plot = final_sensitivity_plot,
+#   path = here("outputs"),  
+#   width =11,                 # in inches
+#   height = 8,
+#   dpi = 600,                 # high resolution for print/PDF
+#   bg = "white"
+# )
+# 
+# 
+# # Save Figure S1 (lag-response)
+# ggsave(
+#   filename = "min_WBGT_sensitivity_lag_response.png",
+#   plot = lag_plot,
+#   path = here("outputs"),  
+#   width =11,                 # in inches
+#   height = 6,
+#   dpi = 600,                 # high resolution for print/PDF
+#   bg = "white"
+# )
+# 
+# # Save Figure S2 (exposure-response)
+# ggsave(
+#   filename = "min_WBGT_sensitivity_exposure_response.png",
+#   plot = exposure_plot,
+#   path = here("outputs"),
+#   width = 11,
+#   height = 6,
+#   dpi = 600,
+#   bg = "white"
+# )
+```
+

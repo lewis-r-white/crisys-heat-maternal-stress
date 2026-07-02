@@ -1,0 +1,255 @@
+---
+title: "Temp metric comparison"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 6
+    toc_float: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+# Load necessary libraries
+library(readxl)     # reading Excel files
+library(tidyverse)      # data manipulation
+library(labelled)   # labeling columns 
+library(here) # file paths
+library(haven)
+library(stargazer)
+library(dlnm)
+library(data.table)
+library(forcats) # For reordering factor levels
+library(broom)
+library(MASS)
+library(brant) # test proportional odds assumption for ordinal logistic regression
+library(gt)
+library(patchwork)
+library(purrr)
+# source in code to load and clean data
+
+## override mass::select and use dplyr as default
+select <- dplyr::select 
+
+source(here("data_cleaning", "clean_stress_data.R")) # pss_recode and crisis_recode are the output datasets of interest
+
+
+# load selected temp data
+era5 <- read_csv(here("data", "GRAPHS-ERA5-CHIRPS", "GRAPHS-ERA5-Heatstress-Tw-1991missing.csv")) %>%
+  filter(date > as.Date("2013-01-01")) %>%
+  mutate(community = case_when(community == "AKORA/AT" ~ "AKORA",
+                               TRUE ~ community)) %>%
+  mutate(wbgt_delta = max_wbgt - min_wbgt)
+
+
+```
+
+
+## Sum NDS Category
+
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+### LOAD THE CRYSIS DATA
+
+## CRYSIS data
+crisis_simple <- crisis_recode %>%
+  mutate(
+    quessetdt = sprintf("%04d", quessetdt),  # Ensure quassetdt has 4 digits
+    quessetdt = sub("(\\d{2})(\\d{2})", "\\1:\\2", quessetdt),  # Insert colon
+    survey_datetime = as.POSIXct(paste(quessetd, quessetdt), format = "%Y-%m-%d %H:%M")) %>%
+    select(mstudyid, fin_events:survey_datetime, neg_fin_groups, neg_rel_groups, neg_home_groups, datdeliv:survey_pre_post_birth, gestage_days, date_conception, married, wealthindex, age, bmi, medlev, fan, pregchn) %>%
+  select(-c(crireadneg:crikidneg)) %>%
+  mutate(month_delivery = lubridate::month(datdeliv),
+         season_delivery = case_when(month_delivery %in% c(4,5,6,7,8,9,10) ~ "wet", 
+                                     month_delivery %in% c(1,2,3,11,12) ~"dry",
+                                     TRUE ~ NA)) %>%
+  
+  mutate(married_bin = case_when(
+      married %in% c(1, 2) ~ "partnered",
+      married %in% c(3, 4, 5, 6) ~ "not_partnered",
+      TRUE ~ NA_character_
+    ),
+    married_bin = factor(married_bin)) %>%
+  
+  mutate(medlev_bin = case_when(
+      medlev == 1 ~ "None",
+      medlev == 2 ~ "Primary",
+      medlev %in% c(3, 4) ~ "≥ JHS",
+      TRUE ~ NA_character_
+    ),
+    medlev_bin = factor(medlev_bin)) %>%
+  
+  mutate(survey_date = as.Date(survey_datetime))  # Extract the date part of survey_datetime
+
+
+```
+
+
+```{r, echo=FALSE, message = FALSE, warning=FALSE}
+
+## Create Daily Lag Frame:
+max_gestation_days <- 210 ## Two weeks into third trimester. This was chosen to avoid post-survey exposure while keeping the full second trimester and sample size. Went two weeks into third trimester so estimates in second trimester more stable, as DLNMs uncertain at edge periods. 
+
+pre_conception_days <- 30
+
+crisis_dlnm_eligible <- crisis_simple %>% 
+  filter(gestage_at_survey >= max_gestation_days) %>% # filter 
+  filter(!is.na(bmi))
+
+
+# Function to process temperature data for the selected metric
+process_temperature_data <- function(era5_data, metric) {
+  era5_data %>%
+    select(community, date, !!sym(metric)) %>%
+    rename(temp_metric = !!sym(metric)) %>%
+    distinct()
+}
+
+
+# Generate lags relative to conception
+create_conception_aligned_lags <- function(df, temp_df) {
+  df %>%
+    select(mstudyid, vname, date_conception) %>%
+    rowwise() %>%
+    mutate(day_relative = list(-pre_conception_days:max_gestation_days),
+           date = list(date_conception + day_relative)) %>%
+    unnest(c(day_relative, date)) %>%
+    left_join(temp_df, by = c("vname" = "community", "date" = "date"))  # join temp
+}
+
+```
+
+### Max WBGT
+
+```{r}
+# Process temp data
+temp_data_clean_wbgt <- process_temperature_data(era5_data = era5, metric = "max_wbgt")
+
+temp_lags_long_wbgt <- create_conception_aligned_lags(crisis_dlnm_eligible, temp_data_clean_wbgt) %>%
+  transmute(mstudyid,
+            date,
+            max_wbgt = temp_metric)
+```
+
+
+### Max TW
+
+```{r}
+# Process temp data
+temp_data_clean_tw <- process_temperature_data(era5_data = era5, metric = "max_tw")
+
+temp_lags_long_tw <- create_conception_aligned_lags(crisis_dlnm_eligible, temp_data_clean_tw) %>%
+  transmute(mstudyid,
+            date,
+            max_tw = temp_metric)
+```
+
+### Max HI
+
+```{r}
+# Process temp data
+temp_data_clean_hi <- process_temperature_data(era5_data = era5, metric = "max_hi")
+
+temp_lags_long_hi <- create_conception_aligned_lags(crisis_dlnm_eligible, temp_data_clean_hi) %>%
+  transmute(mstudyid,
+            date,
+            max_hi = temp_metric)
+```
+
+
+### Max WBGT
+
+```{r}
+# Process temp data
+temp_data_clean_t2mC <- process_temperature_data(era5_data = era5, metric = "max_t2mC")
+
+temp_lags_long_t2mC <- create_conception_aligned_lags(crisis_dlnm_eligible, temp_data_clean_t2mC) %>%
+  transmute(mstudyid,
+            date,
+            max_t2mC = temp_metric)
+```
+
+## join data
+
+```{r}
+full_comparison_data <- left_join(temp_lags_long_wbgt, temp_lags_long_hi) %>%
+  left_join(temp_lags_long_t2mC) %>%
+  left_join(temp_lags_long_tw) %>%
+  
+  mutate(month = lubridate::month(date),
+         
+         season = case_when(month %in% c(4,5,6,7,8,9,10) ~ "Wet Season", 
+                                     month %in% c(1,2,3,11,12) ~"Dry Season",
+                                     TRUE ~ NA),
+         
+         season = factor(season, levels = c("Dry Season", "Wet Season")))
+
+
+df_long <- full_comparison_data %>%
+  select(season, max_wbgt, max_tw, max_hi, max_t2mC) %>%
+  drop_na() %>%
+  pivot_longer(
+    cols = c(max_tw, max_t2mC, max_hi),
+    names_to = "metric",
+    values_to = "y"
+  ) %>%
+  mutate(
+    metric = factor(
+      metric,
+      levels = c("max_tw", "max_t2mC", "max_hi"),
+      labels = c("Max TW (°C)", "Max T2m (°C)", "Max HI (°C)")
+    )
+  )
+
+
+heat_comparison_plot <- ggplot(df_long, aes(x = max_wbgt, y = y)) +
+  geom_hex(aes(fill = after_stat(count)), bins = 45) +
+  facet_grid(metric ~ season, scales = "free_y") +
+  labs(
+    x = "Max WBGT (°C)",
+    y = NULL,
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+
+    axis.line = element_line(linewidth = 0.9, color = "black"),
+    axis.ticks = element_line(linewidth = 0.6, color = "black"),
+    axis.ticks.length = grid::unit(2.5, "pt"),
+
+    axis.text = element_text(size = 11.5, color = "black"),
+    axis.title = element_text(size = 12.5, color = "black"),
+
+    strip.text = element_text(size = 12, face = "bold", color = "black"),
+    strip.background = element_blank(),
+    strip.placement = "outside",
+
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 11),
+    legend.key.height = grid::unit(0.6, "cm")
+  ) +
+  scale_fill_viridis_c(
+    trans = "sqrt",
+    option = "C",
+    end = 0.95
+  )
+# ggsave(here("outputs", "figureS14_heat_comparison_plot.png"),
+#        heat_comparison_plot, 
+#        width = 7, 
+#        height = 7, 
+#        dpi = 400)
+
+ggsave(
+  filename = "Figure_S16.pdf",
+  plot = heat_comparison_plot,
+  path = here("outputs"),  
+  width = 8,
+  height = 10,
+  bg = "white"
+)
+```
+
